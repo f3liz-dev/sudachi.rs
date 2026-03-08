@@ -39,8 +39,9 @@ pub struct WordInfos<'a> {
 /// Block-compressed word_infos state.
 ///
 /// Records are grouped into blocks of `records_per_block` consecutive entries,
-/// each block independently zstd-compressed. A single-entry cache keeps the
-/// last decompressed block to avoid redundant decompression for sequential access.
+/// each block independently zstd-compressed with a trained dictionary.
+/// A single-entry cache keeps the last decompressed block to avoid
+/// redundant decompression for sequential access.
 #[cfg(feature = "marisa-trie")]
 struct BlockCompressedInfo {
     record_offsets_start: usize,
@@ -48,7 +49,14 @@ struct BlockCompressedInfo {
     num_blocks: usize,
     block_index_start: usize,
     compressed_data_start: usize,
-    cache: std::sync::Mutex<(usize, Vec<u8>)>,
+    cache: std::sync::Mutex<BlockCache>,
+}
+
+#[cfg(feature = "marisa-trie")]
+struct BlockCache {
+    block_idx: usize,
+    data: Vec<u8>,
+    decoder: ruzstd::decoding::FrameDecoder,
 }
 
 impl<'a> WordInfos<'a> {
@@ -78,6 +86,18 @@ impl<'a> WordInfos<'a> {
                     u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
                 off += 4;
 
+                // Read zstd dictionary
+                let dict_size =
+                    u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+                off += 4;
+                let dict_bytes = &bytes[off..off + dict_size];
+                off += dict_size;
+
+                let dict = ruzstd::decoding::Dictionary::decode_dict(dict_bytes)
+                    .expect("word_infos dict decode failed");
+                let mut decoder = ruzstd::decoding::FrameDecoder::new();
+                decoder.add_dict(dict).expect("word_infos add_dict failed");
+
                 let record_offsets_start = off;
                 off += num_words * 4;
 
@@ -97,7 +117,11 @@ impl<'a> WordInfos<'a> {
                         num_blocks,
                         block_index_start,
                         compressed_data_start,
-                        cache: std::sync::Mutex::new((usize::MAX, Vec::new())),
+                        cache: std::sync::Mutex::new(BlockCache {
+                            block_idx: usize::MAX,
+                            data: Vec::new(),
+                            decoder,
+                        }),
                     }),
                 };
             }
@@ -156,7 +180,7 @@ impl<'a> WordInfos<'a> {
             ))
         })?;
 
-        if cache.0 != block_idx {
+        if cache.block_idx != block_idx {
             let bi_off = bc.block_index_start + block_idx * 8;
             let block_offset = u32::from_le_bytes(
                 self.bytes[bi_off..bi_off + 4].try_into().unwrap(),
@@ -169,25 +193,34 @@ impl<'a> WordInfos<'a> {
                 [bc.compressed_data_start + block_offset
                     ..bc.compressed_data_start + block_offset + block_size];
 
-            cache.1 = {
+            cache.data = {
                 use std::io::Read;
-                let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed)
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("word_info block zstd init error: {:?}", e),
-                        )
-                    })?;
-                let mut buf = Vec::new();
-                decoder.read_to_end(&mut buf).map_err(|e| {
+                let mut cursor = std::io::Cursor::new(compressed);
+                cache.decoder.reset(&mut cursor).map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("word_info block zstd decompress error: {}", e),
+                        format!("word_info block zstd init error: {:?}", e),
+                    )
+                })?;
+                cache.decoder.decode_blocks(
+                    &mut cursor,
+                    ruzstd::decoding::BlockDecodingStrategy::All,
+                ).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("word_info block zstd decode error: {:?}", e),
+                    )
+                })?;
+                let mut buf = Vec::new();
+                cache.decoder.read_to_end(&mut buf).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("word_info block zstd collect error: {}", e),
                     )
                 })?;
                 buf
             };
-            cache.0 = block_idx;
+            cache.block_idx = block_idx;
         }
 
         let ro_off = bc.record_offsets_start + word_id as usize * 4;
@@ -196,7 +229,7 @@ impl<'a> WordInfos<'a> {
         ) as usize;
 
         let parser = WordInfoParser::subset(subset);
-        parser.parse(&cache.1[record_offset..])
+        parser.parse(&cache.data[record_offset..])
     }
 
     pub fn get_word_info(&self, word_id: u32, mut subset: InfoSubset) -> SudachiResult<WordInfo> {

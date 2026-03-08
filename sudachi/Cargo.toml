@@ -32,7 +32,7 @@ itertools = "0.13" # MIT/Apachie 2.0
 lazy_static = "1.4" # MIT/Apache 2.0
 libloading = "0.8" # ISC (MIT-compatible)
 memmap2 = "0.9" # MIT/Apache 2.0
-ruzstd = { version = "0.8", optional = true } # MIT
+ruzstd = { version = "0.8", git = "https://github.com/KillingSpark/zstd-rs.git", optional = true } # MIT
 nom = "7" # MIT
 regex = "1" # MIT/Apache 2.0
 rsmarisa = { path = "../rsmarisa", optional = true, default-features = false } # BSD-2-Clause

@@ -80,14 +80,16 @@ impl<'a> ConnectionMatrix<'a> {
 
 /// Block-compressed connection matrix for the `marisa-trie` feature.
 ///
-/// The converter stores the matrix as zstd-compressed 64×64 blocks.
+/// The converter stores the matrix as zstd-compressed 64×64 blocks
+/// with a trained zstd dictionary for better small-block compression.
 /// On load, the full matrix is decompressed into a `Vec<i16>`.
-/// This reduces dictionary file size while keeping O(1) cost lookups.
 ///
 /// Binary format:
 /// ```text
 /// [num_left: u16][num_right: u16]
 /// [num_blocks: u32]
+/// [dict_size: u32]
+/// [dictionary: u8 × dict_size]
 /// [block_index: (offset: u32, size: u32) × num_blocks]
 /// [compressed_block_data: ...]
 /// ```
@@ -147,6 +149,20 @@ impl<'a> ConnectionMatrix<'a> {
         let num_blocks = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
+        // Read zstd dictionary
+        let dict_size = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        let dict_bytes = &buf[pos..pos + dict_size];
+        pos += dict_size;
+
+        let dict = ruzstd::decoding::Dictionary::decode_dict(dict_bytes)
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("connection matrix dict decode failed: {:?}", e),
+                )
+            })?;
+
         // Read block index
         let index_size = num_blocks * 8; // (offset: u32, size: u32) per block
         if pos + index_size > buf.len() {
@@ -161,6 +177,15 @@ impl<'a> ConnectionMatrix<'a> {
         }
 
         let data_start = pos;
+
+        // Prepare FrameDecoder with dictionary
+        let mut frame_decoder = ruzstd::decoding::FrameDecoder::new();
+        frame_decoder.add_dict(dict).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("connection matrix add_dict failed: {:?}", e),
+            )
+        })?;
 
         // Decompress all blocks into a flat array
         let total_size = num_left * num_right;
@@ -185,18 +210,27 @@ impl<'a> ConnectionMatrix<'a> {
             let compressed = &buf[abs_offset..abs_end];
             let decompressed = {
                 use std::io::Read;
-                let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed)
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("block {} zstd init failed: {:?}", blk_idx, e),
-                        )
-                    })?;
-                let mut buf = Vec::new();
-                decoder.read_to_end(&mut buf).map_err(|e| {
+                let mut cursor = std::io::Cursor::new(compressed);
+                frame_decoder.reset(&mut cursor).map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("block {} zstd decompression failed: {}", blk_idx, e),
+                        format!("block {} zstd init failed: {:?}", blk_idx, e),
+                    )
+                })?;
+                frame_decoder.decode_blocks(
+                    &mut cursor,
+                    ruzstd::decoding::BlockDecodingStrategy::All,
+                ).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("block {} zstd decode failed: {:?}", blk_idx, e),
+                    )
+                })?;
+                let mut buf = Vec::new();
+                frame_decoder.read_to_end(&mut buf).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("block {} zstd collect failed: {}", blk_idx, e),
                     )
                 })?;
                 buf
