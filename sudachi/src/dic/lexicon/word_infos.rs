@@ -23,11 +23,32 @@ use crate::dic::subset::InfoSubset;
 use crate::dic::word_id::WordId;
 use crate::prelude::*;
 
+/// Magic marker for block-compressed word_infos (MARISA converted dictionaries).
+#[cfg(feature = "marisa-trie")]
+const BLOCK_WI_MAGIC: u32 = 0x4D57_4942; // "MWIB"
+
 pub struct WordInfos<'a> {
     bytes: &'a [u8],
     offset: usize,
     _word_size: u32,
     has_synonym_group_ids: bool,
+    #[cfg(feature = "marisa-trie")]
+    block_compressed: Option<BlockCompressedInfo>,
+}
+
+/// Block-compressed word_infos state.
+///
+/// Records are grouped into blocks of `records_per_block` consecutive entries,
+/// each block independently deflate-compressed. A single-entry cache keeps the
+/// last decompressed block to avoid redundant decompression for sequential access.
+#[cfg(feature = "marisa-trie")]
+struct BlockCompressedInfo {
+    record_offsets_start: usize,
+    records_per_block: usize,
+    num_blocks: usize,
+    block_index_start: usize,
+    compressed_data_start: usize,
+    cache: std::sync::Mutex<(usize, Vec<u8>)>,
 }
 
 impl<'a> WordInfos<'a> {
@@ -37,6 +58,60 @@ impl<'a> WordInfos<'a> {
         _word_size: u32,
         has_synonym_group_ids: bool,
     ) -> WordInfos<'a> {
+        #[cfg(feature = "marisa-trie")]
+        {
+            let maybe_magic = if offset + 4 <= bytes.len() {
+                u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+            } else {
+                0
+            };
+
+            if maybe_magic == BLOCK_WI_MAGIC {
+                let mut off = offset + 4;
+                let num_words =
+                    u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+                off += 4;
+                let records_per_block =
+                    u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap()) as usize;
+                off += 2;
+                let num_blocks =
+                    u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+                off += 4;
+
+                let record_offsets_start = off;
+                off += num_words * 4;
+
+                let block_index_start = off;
+                off += num_blocks * 8;
+
+                let compressed_data_start = off;
+
+                return WordInfos {
+                    bytes,
+                    offset,
+                    _word_size: num_words as u32,
+                    has_synonym_group_ids,
+                    block_compressed: Some(BlockCompressedInfo {
+                        record_offsets_start,
+                        records_per_block,
+                        num_blocks,
+                        block_index_start,
+                        compressed_data_start,
+                        cache: std::sync::Mutex::new((usize::MAX, Vec::new())),
+                    }),
+                };
+            }
+
+            return WordInfos {
+                bytes,
+                offset,
+                _word_size,
+                has_synonym_group_ids,
+                block_compressed: None,
+            };
+        }
+
+        #[cfg(not(feature = "marisa-trie"))]
         WordInfos {
             bytes,
             offset,
@@ -50,9 +125,66 @@ impl<'a> WordInfos<'a> {
     }
 
     fn parse_word_info(&self, word_id: u32, subset: InfoSubset) -> SudachiResult<WordInfoData> {
+        #[cfg(feature = "marisa-trie")]
+        if let Some(ref bc) = self.block_compressed {
+            return self.parse_word_info_block(bc, word_id, subset);
+        }
+
         let index = self.word_id_to_offset(word_id)?;
         let parser = WordInfoParser::subset(subset);
         parser.parse(&self.bytes[index..])
+    }
+
+    /// Parse a word_info record from a block-compressed section.
+    ///
+    /// Finds the block containing `word_id`, decompresses it (caching the
+    /// result), then parses the record at the stored intra-block offset.
+    #[cfg(feature = "marisa-trie")]
+    fn parse_word_info_block(
+        &self,
+        bc: &BlockCompressedInfo,
+        word_id: u32,
+        subset: InfoSubset,
+    ) -> SudachiResult<WordInfoData> {
+        let block_idx = word_id as usize / bc.records_per_block;
+        debug_assert!(block_idx < bc.num_blocks);
+
+        let mut cache = bc.cache.lock().map_err(|_| {
+            SudachiError::from(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "word_info cache lock poisoned",
+            ))
+        })?;
+
+        if cache.0 != block_idx {
+            let bi_off = bc.block_index_start + block_idx * 8;
+            let block_offset = u32::from_le_bytes(
+                self.bytes[bi_off..bi_off + 4].try_into().unwrap(),
+            ) as usize;
+            let block_size = u32::from_le_bytes(
+                self.bytes[bi_off + 4..bi_off + 8].try_into().unwrap(),
+            ) as usize;
+
+            let compressed = &self.bytes
+                [bc.compressed_data_start + block_offset
+                    ..bc.compressed_data_start + block_offset + block_size];
+
+            cache.1 = miniz_oxide::inflate::decompress_to_vec(compressed).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("word_info block decompress error: {:?}", e),
+                )
+            })?;
+            cache.0 = block_idx;
+        }
+
+        let ro_off = bc.record_offsets_start + word_id as usize * 4;
+        let record_offset = u32::from_le_bytes(
+            self.bytes[ro_off..ro_off + 4].try_into().unwrap(),
+        ) as usize;
+
+        let parser = WordInfoParser::subset(subset);
+        parser.parse(&cache.1[record_offset..])
     }
 
     pub fn get_word_info(&self, word_id: u32, mut subset: InfoSubset) -> SudachiResult<WordInfo> {

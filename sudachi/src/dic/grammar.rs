@@ -55,6 +55,7 @@ impl<'a> Grammar<'a> {
     ///
     /// buf: reference to the dictionary bytes
     /// offset: offset to the grammar section in the buf
+    #[cfg(not(feature = "marisa-trie"))]
     pub fn parse(buf: &[u8], offset: usize) -> SudachiResult<Grammar> {
         let (rest, (pos_list, left_id_size, right_id_size)) = grammar_parser(buf, offset)
             .map_err(|e| SudachiError::InvalidDictionaryGrammar.with_context(e.to_string()))?;
@@ -77,6 +78,59 @@ impl<'a> Grammar<'a> {
             storage_size,
             character_category: CharacterCategory::default(),
         })
+    }
+
+    /// Creates a Grammar from dictionary bytes (MARISA variant).
+    ///
+    /// Supports both uncompressed matrices (from DictBuilder) and
+    /// block-compressed matrices (from dic_converter). A compressed
+    /// matrix is identified by the magic `0x4D435A42` ("MCZB") at the
+    /// start of the connection-table area.
+    #[cfg(feature = "marisa-trie")]
+    pub fn parse(buf: &[u8], offset: usize) -> SudachiResult<Grammar> {
+        let (rest, (pos_list, left_id_size, right_id_size)) = grammar_parser(buf, offset)
+            .map_err(|e| SudachiError::InvalidDictionaryGrammar.with_context(e.to_string()))?;
+
+        let connect_table_offset = buf.len() - rest.len();
+
+        // Check for compressed connection matrix magic
+        const COMPRESSED_MAGIC: u32 = 0x4D43_5A42; // "MCZB"
+        let maybe_magic = if connect_table_offset + 4 <= buf.len() {
+            u32::from_le_bytes(buf[connect_table_offset..connect_table_offset + 4].try_into().unwrap())
+        } else {
+            0
+        };
+
+        if maybe_magic == COMPRESSED_MAGIC {
+            // Compressed connection matrix
+            let (conn, consumed) =
+                ConnectionMatrix::from_compressed(buf, connect_table_offset + 4)?;
+            let storage_size = (connect_table_offset - offset) + 4 + consumed;
+            Ok(Grammar {
+                _bytes: buf,
+                pos_list,
+                connection: conn,
+                storage_size,
+                character_category: CharacterCategory::default(),
+            })
+        } else {
+            // Uncompressed (from DictBuilder)
+            let storage_size = (connect_table_offset - offset)
+                + 2 * left_id_size as usize * right_id_size as usize;
+            let conn = ConnectionMatrix::from_offset_size(
+                buf,
+                connect_table_offset,
+                left_id_size as usize,
+                right_id_size as usize,
+            )?;
+            Ok(Grammar {
+                _bytes: buf,
+                pos_list,
+                connection: conn,
+                storage_size,
+                character_category: CharacterCategory::default(),
+            })
+        }
     }
 
     /// Returns connection cost of nodes

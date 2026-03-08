@@ -70,6 +70,8 @@ impl<'a> IndexBuilder<'a> {
         Ok(result)
     }
 
+    /// Build a YADA double-array trie from the index entries.
+    #[cfg(not(feature = "marisa-trie"))]
     pub fn build_trie(&mut self) -> SudachiResult<Vec<u8>> {
         let mut trie_entries: Vec<(&str, u32)> = Vec::new();
         for (k, v) in self.data.drain(..) {
@@ -97,46 +99,131 @@ impl<'a> IndexBuilder<'a> {
             .into()),
         }
     }
+
+    /// Build a MARISA trie and serialize it (trie bytes + ID-to-offset mapping).
+    #[cfg(feature = "marisa-trie")]
+    pub fn build_trie(&mut self) -> SudachiResult<Vec<u8>> {
+        use crate::dic::lexicon::marisa_trie::MarisaTrie;
+
+        let mut trie_entries: Vec<(&str, u32)> = Vec::new();
+        for (k, v) in self.data.drain(..) {
+            if v.offset > u32::MAX as _ {
+                return Err(DicBuildError {
+                    file: format!("entry {}", k),
+                    line: 0,
+                    cause: BuildFailure::WordIdTableNotBuilt,
+                }
+                .into());
+            }
+            trie_entries.push((k, v.offset as u32));
+        }
+        self.data.shrink_to_fit();
+
+        let marisa = MarisaTrie::build(&trie_entries).map_err(|_| DicBuildError {
+            file: "<marisa-trie>".to_owned(),
+            line: 0,
+            cause: BuildFailure::TrieBuildFailure,
+        })?;
+
+        marisa.to_bytes().map_err(|_| {
+            DicBuildError {
+                file: "<marisa-trie-serialize>".to_owned(),
+                line: 0,
+                cause: BuildFailure::TrieBuildFailure,
+            }
+            .into()
+        })
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::dic::lexicon::trie::{Trie, TrieEntry};
-    use std::convert::TryInto;
+    use crate::dic::lexicon::trie::TrieEntry;
 
-    fn make_trie(data: Vec<u8>) -> Trie<'static> {
-        let mut elems: Vec<u32> = Vec::with_capacity(data.len() / 4);
-        for i in (0..data.len()).step_by(4) {
-            let arr: [u8; 4] = data[i..i + 4].try_into().unwrap();
-            elems.push(u32::from_le_bytes(arr))
+    #[cfg(not(feature = "marisa-trie"))]
+    mod yada_tests {
+        use super::*;
+        use crate::dic::lexicon::trie::Trie;
+        use std::convert::TryInto;
+
+        fn make_trie(data: Vec<u8>) -> Trie<'static> {
+            let mut elems: Vec<u32> = Vec::with_capacity(data.len() / 4);
+            for i in (0..data.len()).step_by(4) {
+                let arr: [u8; 4] = data[i..i + 4].try_into().unwrap();
+                elems.push(u32::from_le_bytes(arr))
+            }
+            Trie::new_owned(elems)
         }
-        Trie::new_owned(elems)
+
+        #[test]
+        fn build_index_1() {
+            let mut bldr = IndexBuilder::new();
+            bldr.add("test", WordId::new(0, 0));
+            let _ = bldr.build_word_id_table().unwrap();
+
+            let trie = make_trie(bldr.build_trie().unwrap());
+            let mut iter = trie.common_prefix_iterator(b"test", 0);
+            assert_eq!(iter.next(), Some(TrieEntry { value: 0, end: 4 }));
+            assert_eq!(iter.next(), None);
+        }
+
+        #[test]
+        fn build_index_2() {
+            let mut bldr = IndexBuilder::new();
+            bldr.add("test", WordId::new(0, 0));
+            bldr.add("tes", WordId::new(0, 1));
+            let _ = bldr.build_word_id_table().unwrap();
+
+            let trie = make_trie(bldr.build_trie().unwrap());
+            let mut iter = trie.common_prefix_iterator(b"test", 0);
+            assert_eq!(iter.next(), Some(TrieEntry { value: 5, end: 3 }));
+            assert_eq!(iter.next(), Some(TrieEntry { value: 0, end: 4 }));
+            assert_eq!(iter.next(), None);
+        }
     }
 
-    #[test]
-    fn build_index_1() {
-        let mut bldr = IndexBuilder::new();
-        bldr.add("test", WordId::new(0, 0));
-        let _ = bldr.build_word_id_table().unwrap();
+    #[cfg(feature = "marisa-trie")]
+    mod marisa_tests {
+        use super::*;
+        use crate::dic::lexicon::marisa_trie::MarisaTrie;
 
-        let trie = make_trie(bldr.build_trie().unwrap());
-        let mut iter = trie.common_prefix_iterator(b"test", 0);
-        assert_eq!(iter.next(), Some(TrieEntry { value: 0, end: 4 }));
-        assert_eq!(iter.next(), None);
-    }
+        #[test]
+        fn build_index_marisa_1() {
+            let mut bldr = IndexBuilder::new();
+            bldr.add("test", WordId::new(0, 0));
+            let _ = bldr.build_word_id_table().unwrap();
 
-    #[test]
-    fn build_index_2() {
-        let mut bldr = IndexBuilder::new();
-        bldr.add("test", WordId::new(0, 0));
-        bldr.add("tes", WordId::new(0, 1));
-        let _ = bldr.build_word_id_table().unwrap();
+            let trie_bytes = bldr.build_trie().unwrap();
+            let (trie, _) = MarisaTrie::from_bytes(&trie_bytes, 0).unwrap();
 
-        let trie = make_trie(bldr.build_trie().unwrap());
-        let mut iter = trie.common_prefix_iterator(b"test", 0);
-        assert_eq!(iter.next(), Some(TrieEntry { value: 5, end: 3 }));
-        assert_eq!(iter.next(), Some(TrieEntry { value: 0, end: 4 }));
-        assert_eq!(iter.next(), None);
+            let results: Vec<TrieEntry> = trie.common_prefix_iterator(b"test", 0).collect();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].value, 0);
+            assert_eq!(results[0].end, 4);
+        }
+
+        #[test]
+        fn build_index_marisa_2() {
+            let mut bldr = IndexBuilder::new();
+            bldr.add("test", WordId::new(0, 0));
+            bldr.add("tes", WordId::new(0, 1));
+            let _ = bldr.build_word_id_table().unwrap();
+
+            let trie_bytes = bldr.build_trie().unwrap();
+            let (trie, _) = MarisaTrie::from_bytes(&trie_bytes, 0).unwrap();
+
+            let results: Vec<TrieEntry> = trie.common_prefix_iterator(b"test", 0).collect();
+            assert_eq!(results.len(), 2);
+
+            // Both "tes" and "test" should be found, values mapping to their offsets
+            let mut entries: Vec<(usize, u32)> =
+                results.iter().map(|e| (e.end, e.value)).collect();
+            entries.sort_by_key(|&(end, _)| end);
+            assert_eq!(entries[0].0, 3); // "tes" ends at 3
+            assert_eq!(entries[0].1, 5); // offset 5
+            assert_eq!(entries[1].0, 4); // "test" ends at 4
+            assert_eq!(entries[1].1, 0); // offset 0
+        }
     }
 }

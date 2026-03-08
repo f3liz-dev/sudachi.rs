@@ -269,11 +269,21 @@ impl<D: DictionaryAccess> DictBuilder<D> {
         let word_id_table = index.build_word_id_table()?;
         let trie = index.build_trie()?;
 
-        let trie_size = trie.len() / 4;
-        w.write_all(&(trie_size as u32).to_le_bytes())?;
-        size += 4;
-        w.write_all(&trie)?;
-        size += trie.len();
+        // MARISA format: trie bytes are self-describing (contain their own length headers).
+        // YADA format: [trie_size: u32][trie_data: u32 × trie_size].
+        #[cfg(not(feature = "marisa-trie"))]
+        {
+            let trie_size = trie.len() / 4;
+            w.write_all(&(trie_size as u32).to_le_bytes())?;
+            size += 4;
+            w.write_all(&trie)?;
+            size += trie.len();
+        }
+        #[cfg(feature = "marisa-trie")]
+        {
+            w.write_all(&trie)?;
+            size += trie.len();
+        }
         std::mem::drop(trie); //can be big, so drop explicitly
         self.reporter.collect(size, report);
         let cur_size = size;

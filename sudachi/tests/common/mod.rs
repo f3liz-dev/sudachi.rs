@@ -48,7 +48,11 @@ pub fn dictionary_bytes_from_path<P: AsRef<Path>>(dictionary_path: P) -> Sudachi
 
 lazy_static! {
     pub static ref TEST_CONFIG: Config = {
+        #[cfg(feature = "marisa-trie")]
+        let test_config_path = "tests/resources/sudachi_marisa.json";
+        #[cfg(not(feature = "marisa-trie"))]
         let test_config_path = "tests/resources/sudachi.json";
+
         let conf = Config::new(Some(PathBuf::from(test_config_path)), None, None)
             .expect("Failed to read config file for test");
         println!("{:?}", conf);

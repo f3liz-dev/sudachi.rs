@@ -16,6 +16,11 @@ default = ["build-dictionary"]
 ## Not needed for tokenization; automatically excluded from WASM builds that
 ## use `default-features = false`.
 build-dictionary = ["dep:csv"]
+## Use MARISA trie instead of YADA double-array trie for the lexicon index.
+## MARISA (Matching Algorithm with Recursively Implemented StorAge) is a static,
+## space-efficient trie that typically uses 5-10x less RAM than double-array tries.
+## Dictionaries must be built AND loaded with this feature consistently.
+marisa-trie = ["dep:rsmarisa", "dep:miniz_oxide"]
 
 [dependencies] # this should be sorted
 aho-corasick = "1" # MIT/Apache 2.0
@@ -27,8 +32,10 @@ itertools = "0.13" # MIT/Apachie 2.0
 lazy_static = "1.4" # MIT/Apache 2.0
 libloading = "0.8" # ISC (MIT-compatible)
 memmap2 = "0.9" # MIT/Apache 2.0
+miniz_oxide = { version = "0.8", optional = true } # MIT/Apache 2.0/Zlib
 nom = "7" # MIT
 regex = "1" # MIT/Apache 2.0
+rsmarisa = { path = "../rsmarisa", optional = true, default-features = false } # BSD-2-Clause
 serde = { version = "1.0", features = ["derive"] } # MIT/Apache 2.0
 serde_json = "1.0" # MIT/Apache 2.0
 thiserror = "1.0" # MIT/Apache 2.0

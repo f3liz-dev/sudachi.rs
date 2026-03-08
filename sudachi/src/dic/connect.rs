@@ -17,12 +17,15 @@
 use crate::error::{SudachiError, SudachiResult};
 use crate::util::cow_array::CowArray;
 
+/// The flat (uncompressed) connection matrix, used when `marisa-trie` is NOT enabled.
+#[cfg(not(feature = "marisa-trie"))]
 pub struct ConnectionMatrix<'a> {
     data: CowArray<'a, i16>,
     num_left: usize,
     num_right: usize,
 }
 
+#[cfg(not(feature = "marisa-trie"))]
 impl<'a> ConnectionMatrix<'a> {
     pub fn from_offset_size(
         data: &'a [u8],
@@ -55,15 +58,6 @@ impl<'a> ConnectionMatrix<'a> {
         index
     }
 
-    /// Gets the value of the connection matrix
-    ///
-    /// It is performance critical that this function
-    /// 1. Has no branches
-    /// 2. Is inlined to the caller
-    ///
-    /// This is UB if index is out of bounds, but that can't happen
-    /// except in the case if the binary dictionary was tampered with.
-    /// It is OK to make usage of tampered binary dictionaries UB.
     #[inline(always)]
     pub fn cost(&self, left: u16, right: u16) -> i16 {
         let index = self.index(left, right);
@@ -75,12 +69,187 @@ impl<'a> ConnectionMatrix<'a> {
         self.data.set(index, value);
     }
 
-    /// Returns maximum number of left connection ID
     pub fn num_left(&self) -> usize {
         self.num_left
     }
 
-    /// Returns maximum number of right connection ID
+    pub fn num_right(&self) -> usize {
+        self.num_right
+    }
+}
+
+/// Block-compressed connection matrix for the `marisa-trie` feature.
+///
+/// The converter stores the matrix as deflate-compressed 64×64 blocks.
+/// On load, the full matrix is decompressed into a `Vec<i16>`.
+/// This reduces dictionary file size by ~3x while keeping O(1) cost lookups.
+///
+/// Binary format:
+/// ```text
+/// [num_left: u16][num_right: u16]
+/// [num_blocks: u32]
+/// [block_index: (offset: u32, size: u32) × num_blocks]
+/// [compressed_block_data: ...]
+/// ```
+#[cfg(feature = "marisa-trie")]
+pub struct ConnectionMatrix<'a> {
+    _phantom: std::marker::PhantomData<&'a ()>,
+    data: Vec<i16>,
+    num_left: usize,
+    num_right: usize,
+}
+
+#[cfg(feature = "marisa-trie")]
+impl<'a> ConnectionMatrix<'a> {
+    /// Block size for compression (64×64 cells per block).
+    pub const BLOCK_SIZE: usize = 64;
+
+    /// Read the flat (uncompressed) connection matrix — used when loading
+    /// dictionaries that have NOT been converted (e.g., dictionaries built
+    /// from source via `DictBuilder`).
+    pub fn from_offset_size(
+        buf: &'a [u8],
+        offset: usize,
+        num_left: usize,
+        num_right: usize,
+    ) -> SudachiResult<ConnectionMatrix<'a>> {
+        let size = num_left * num_right;
+        let byte_size = size * 2;
+        if offset + byte_size > buf.len() {
+            return Err(SudachiError::InvalidDictionaryGrammar.with_context("connection matrix"));
+        }
+
+        let mut data = vec![0i16; size];
+        for i in 0..size {
+            let pos = offset + i * 2;
+            data[i] = i16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap());
+        }
+
+        Ok(ConnectionMatrix {
+            _phantom: std::marker::PhantomData,
+            data,
+            num_left,
+            num_right,
+        })
+    }
+
+    /// Read a block-compressed connection matrix from the dictionary.
+    pub fn from_compressed(buf: &[u8], offset: usize) -> SudachiResult<(ConnectionMatrix<'a>, usize)> {
+        let mut pos = offset;
+
+        if pos + 4 > buf.len() {
+            return Err(SudachiError::InvalidDictionaryGrammar.with_context("compressed conn header"));
+        }
+        let num_left = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+        let num_right = u16::from_le_bytes(buf[pos + 2..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        let num_blocks = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        // Read block index
+        let index_size = num_blocks * 8; // (offset: u32, size: u32) per block
+        if pos + index_size > buf.len() {
+            return Err(SudachiError::InvalidDictionaryGrammar.with_context("compressed conn index"));
+        }
+        let mut block_index = Vec::with_capacity(num_blocks);
+        for _ in 0..num_blocks {
+            let blk_offset = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+            let blk_size = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            block_index.push((blk_offset, blk_size));
+            pos += 8;
+        }
+
+        let data_start = pos;
+
+        // Decompress all blocks into a flat array
+        let total_size = num_left * num_right;
+        let mut data = vec![0i16; total_size];
+
+        let bs = Self::BLOCK_SIZE;
+        let num_row_blocks = (num_right + bs - 1) / bs;
+        let num_col_blocks = (num_left + bs - 1) / bs;
+
+        let mut max_data_end = data_start;
+
+        for (blk_idx, &(blk_offset, blk_size)) in block_index.iter().enumerate() {
+            let abs_offset = data_start + blk_offset;
+            let abs_end = abs_offset + blk_size;
+            if abs_end > buf.len() {
+                return Err(SudachiError::InvalidDictionaryGrammar.with_context("compressed block data"));
+            }
+            if abs_end > max_data_end {
+                max_data_end = abs_end;
+            }
+
+            let compressed = &buf[abs_offset..abs_end];
+            let decompressed = miniz_oxide::inflate::decompress_to_vec(compressed)
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("block {} decompression failed: {:?}", blk_idx, e),
+                    )
+                })?;
+
+            // Determine block position in the matrix
+            let row_block = blk_idx / num_col_blocks;
+            let col_block = blk_idx % num_col_blocks;
+            let row_start = row_block * bs;
+            let col_start = col_block * bs;
+
+            // Copy decompressed i16 values into the flat array
+            // Block layout matches matrix layout: row-major within the block,
+            // where "row" = right_id, "col" = left_id
+            let mut src = 0;
+            for r in row_start..std::cmp::min(row_start + bs, num_right) {
+                for c in col_start..std::cmp::min(col_start + bs, num_left) {
+                    if src + 1 < decompressed.len() {
+                        let val = i16::from_le_bytes(
+                            decompressed[src..src + 2].try_into().unwrap(),
+                        );
+                        data[r * num_left + c] = val;
+                    }
+                    src += 2;
+                }
+            }
+        }
+
+        let consumed = max_data_end - offset;
+        Ok((
+            ConnectionMatrix {
+                _phantom: std::marker::PhantomData,
+                data,
+                num_left,
+                num_right,
+            },
+            consumed,
+        ))
+    }
+
+    #[inline(always)]
+    fn index(&self, left: u16, right: u16) -> usize {
+        let uleft = left as usize;
+        let uright = right as usize;
+        debug_assert!(uleft < self.num_left);
+        debug_assert!(uright < self.num_right);
+        uright * self.num_left + uleft
+    }
+
+    #[inline(always)]
+    pub fn cost(&self, left: u16, right: u16) -> i16 {
+        let index = self.index(left, right);
+        *unsafe { self.data.get_unchecked(index) }
+    }
+
+    pub fn update(&mut self, left: u16, right: u16, value: i16) {
+        let index = self.index(left, right);
+        self.data[index] = value;
+    }
+
+    pub fn num_left(&self) -> usize {
+        self.num_left
+    }
+
     pub fn num_right(&self) -> usize {
         self.num_right
     }
