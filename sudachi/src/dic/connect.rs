@@ -80,7 +80,7 @@ impl<'a> ConnectionMatrix<'a> {
 
 /// Block-compressed connection matrix for the `marisa-trie` feature.
 ///
-/// The converter stores the matrix as zstd-compressed 64×64 blocks
+/// The converter stores the matrix as zstd-compressed 256×256 blocks
 /// with a trained zstd dictionary for better small-block compression.
 /// On load, the full matrix is decompressed into a `Vec<i16>`.
 ///
@@ -103,8 +103,8 @@ pub struct ConnectionMatrix<'a> {
 
 #[cfg(feature = "marisa-trie")]
 impl<'a> ConnectionMatrix<'a> {
-    /// Block size for compression (64×64 cells per block).
-    pub const BLOCK_SIZE: usize = 64;
+    /// Block size for compression (256×256 cells per block).
+    pub const BLOCK_SIZE: usize = 256;
 
     /// Read the flat (uncompressed) connection matrix — used when loading
     /// dictionaries that have NOT been converted (e.g., dictionaries built
