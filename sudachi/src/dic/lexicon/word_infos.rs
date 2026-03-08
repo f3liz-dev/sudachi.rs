@@ -39,7 +39,7 @@ pub struct WordInfos<'a> {
 /// Block-compressed word_infos state.
 ///
 /// Records are grouped into blocks of `records_per_block` consecutive entries,
-/// each block independently deflate-compressed. A single-entry cache keeps the
+/// each block independently zstd-compressed. A single-entry cache keeps the
 /// last decompressed block to avoid redundant decompression for sequential access.
 #[cfg(feature = "marisa-trie")]
 struct BlockCompressedInfo {
@@ -169,12 +169,24 @@ impl<'a> WordInfos<'a> {
                 [bc.compressed_data_start + block_offset
                     ..bc.compressed_data_start + block_offset + block_size];
 
-            cache.1 = miniz_oxide::inflate::decompress_to_vec(compressed).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("word_info block decompress error: {:?}", e),
-                )
-            })?;
+            cache.1 = {
+                use std::io::Read;
+                let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed)
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("word_info block zstd init error: {:?}", e),
+                        )
+                    })?;
+                let mut buf = Vec::new();
+                decoder.read_to_end(&mut buf).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("word_info block zstd decompress error: {}", e),
+                    )
+                })?;
+                buf
+            };
             cache.0 = block_idx;
         }
 

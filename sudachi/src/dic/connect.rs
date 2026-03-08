@@ -80,9 +80,9 @@ impl<'a> ConnectionMatrix<'a> {
 
 /// Block-compressed connection matrix for the `marisa-trie` feature.
 ///
-/// The converter stores the matrix as deflate-compressed 64×64 blocks.
+/// The converter stores the matrix as zstd-compressed 64×64 blocks.
 /// On load, the full matrix is decompressed into a `Vec<i16>`.
-/// This reduces dictionary file size by ~3x while keeping O(1) cost lookups.
+/// This reduces dictionary file size while keeping O(1) cost lookups.
 ///
 /// Binary format:
 /// ```text
@@ -183,13 +183,24 @@ impl<'a> ConnectionMatrix<'a> {
             }
 
             let compressed = &buf[abs_offset..abs_end];
-            let decompressed = miniz_oxide::inflate::decompress_to_vec(compressed)
-                .map_err(|e| {
+            let decompressed = {
+                use std::io::Read;
+                let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed)
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("block {} zstd init failed: {:?}", blk_idx, e),
+                        )
+                    })?;
+                let mut buf = Vec::new();
+                decoder.read_to_end(&mut buf).map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("block {} decompression failed: {:?}", blk_idx, e),
+                        format!("block {} zstd decompression failed: {}", blk_idx, e),
                     )
                 })?;
+                buf
+            };
 
             // Determine block position in the matrix
             let row_block = blk_idx / num_col_blocks;
