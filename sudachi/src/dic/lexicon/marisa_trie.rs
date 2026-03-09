@@ -208,6 +208,35 @@ impl MarisaTrie {
             done: false,
         }
     }
+
+    /// Access the id_to_offset mapping value for a given key ID.
+    #[inline]
+    pub fn id_to_offset_val(&self, key_id: usize) -> u32 {
+        self.id_to_offset[key_id]
+    }
+
+    /// Predictive search: find all keys starting with `prefix`, returning
+    /// (reading_string, word_ids) pairs using the provided word_id_table.
+    pub fn predictive_search_entries(
+        &self,
+        prefix: &str,
+        word_id_table: &super::word_id_table::WordIdTable,
+    ) -> Vec<(String, Vec<u32>)> {
+        let mut agent = Agent::new();
+        agent.set_query_str(prefix);
+
+        let mut results = Vec::new();
+        while self.trie.predictive_search(&mut agent) {
+            let key_str = std::str::from_utf8(agent.key().as_bytes())
+                .unwrap_or_default()
+                .to_string();
+            let key_id = agent.key().id();
+            let offset = self.id_to_offset[key_id];
+            let word_ids: Vec<u32> = word_id_table.entries(offset as usize).collect();
+            results.push((key_str, word_ids));
+        }
+        results
+    }
 }
 
 #[cfg(test)]

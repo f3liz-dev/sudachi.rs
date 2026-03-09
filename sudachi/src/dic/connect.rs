@@ -61,7 +61,7 @@ impl<'a> ConnectionMatrix<'a> {
     #[inline(always)]
     pub fn cost(&self, left: u16, right: u16) -> i16 {
         let index = self.index(left, right);
-        *unsafe { self.data.get_unchecked(index) }
+        self.data.get(index).copied().unwrap_or(0)
     }
 
     pub fn update(&mut self, left: u16, right: u16, value: i16) {
@@ -283,7 +283,7 @@ impl<'a> ConnectionMatrix<'a> {
     #[inline(always)]
     pub fn cost(&self, left: u16, right: u16) -> i16 {
         let index = self.index(left, right);
-        *unsafe { self.data.get_unchecked(index) }
+        self.data.get(index).copied().unwrap_or(0)
     }
 
     pub fn update(&mut self, left: u16, right: u16, value: i16) {

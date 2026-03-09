@@ -41,6 +41,9 @@ pub mod word_params;
 #[cfg(feature = "marisa-trie")]
 pub mod marisa_trie;
 
+#[cfg(feature = "marisa-trie")]
+pub mod reading_trie;
+
 /// The first 4 bits of word_id are used to indicate that from which lexicon
 /// the word comes, thus we can only hold 15 lexicons in the same time.
 /// 16th is reserved for marking OOVs.
@@ -48,7 +51,7 @@ pub const MAX_DICTIONARIES: usize = 15;
 
 /// Dictionary lexicon
 ///
-/// Contains trie, word_id, word_param, word_info
+/// Contains trie, word_id, word_param, word_info, and optionally a reading trie
 pub struct Lexicon<'a> {
     #[cfg(not(feature = "marisa-trie"))]
     trie: Trie<'a>,
@@ -58,6 +61,8 @@ pub struct Lexicon<'a> {
     word_params: WordParams<'a>,
     word_infos: WordInfos<'a>,
     lex_id: u8,
+    #[cfg(feature = "marisa-trie")]
+    reading_trie: Option<reading_trie::ReadingTrie<'a>>,
 }
 
 /// Result of the Lexicon lookup
@@ -132,7 +137,12 @@ impl<'a> Lexicon<'a> {
         let word_params = WordParams::new(buf, word_params_size, offset + 4);
         offset += word_params.storage_size();
 
+        let word_infos_offset = offset;
         let word_infos = WordInfos::new(buf, offset, word_params.size(), has_synonym_group_ids);
+
+        // Try to detect and load reading trie after word_infos section.
+        // Compute word_infos section size, then check for RTRI magic.
+        let reading_trie = Self::try_load_reading_trie(buf, word_infos_offset, word_params.size());
 
         Ok(Lexicon {
             trie,
@@ -140,6 +150,7 @@ impl<'a> Lexicon<'a> {
             word_params,
             word_infos,
             lex_id: u8::MAX,
+            reading_trie,
         })
     }
 
@@ -209,6 +220,118 @@ impl<'a> Lexicon<'a> {
 
     pub fn size(&self) -> u32 {
         self.word_params.size()
+    }
+
+    /// Returns the reading trie, if one was loaded from the dictionary.
+    #[cfg(feature = "marisa-trie")]
+    pub fn reading_trie(&self) -> Option<&reading_trie::ReadingTrie<'a>> {
+        self.reading_trie.as_ref()
+    }
+
+    /// Returns true if this lexicon has a pre-built reading trie.
+    #[cfg(feature = "marisa-trie")]
+    pub fn has_reading_trie(&self) -> bool {
+        self.reading_trie.is_some()
+    }
+
+    /// Try to load a reading trie from the dictionary bytes after the word_infos
+    /// section. Returns None if no reading trie is found (backward compatible).
+    #[cfg(feature = "marisa-trie")]
+    fn try_load_reading_trie(
+        buf: &[u8],
+        word_infos_offset: usize,
+        num_words: u32,
+    ) -> Option<reading_trie::ReadingTrie> {
+        // Compute word_infos section size by parsing its header.
+        let wi_size = Self::compute_word_infos_size(buf, word_infos_offset, num_words)?;
+        let reading_trie_offset = word_infos_offset + wi_size;
+
+        // Check if there's enough room for the RTRI magic
+        if reading_trie_offset + 4 > buf.len() {
+            return None;
+        }
+
+        let magic = u32::from_le_bytes(
+            buf[reading_trie_offset..reading_trie_offset + 4]
+                .try_into()
+                .ok()?,
+        );
+        if magic != reading_trie::READING_TRIE_MAGIC {
+            return None;
+        }
+
+        match reading_trie::ReadingTrie::from_bytes(buf, reading_trie_offset) {
+            Ok((rt, _consumed)) => Some(rt),
+            Err(_) => None,
+        }
+    }
+
+    /// Compute the total byte size of a block-compressed word_infos section.
+    #[cfg(feature = "marisa-trie")]
+    fn compute_word_infos_size(
+        buf: &[u8],
+        offset: usize,
+        num_words: u32,
+    ) -> Option<usize> {
+        const BLOCK_WI_MAGIC: u32 = 0x4D57_4942;
+
+        if offset + 4 > buf.len() {
+            return None;
+        }
+        let magic = u32::from_le_bytes(buf[offset..offset + 4].try_into().ok()?);
+        if magic != BLOCK_WI_MAGIC {
+            // Uncompressed word_infos — extends to end of buffer (no reading trie)
+            return None;
+        }
+
+        let mut pos = offset + 4;
+        // num_words
+        let _nw = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
+        pos += 4;
+        // records_per_block
+        let _rpb = u16::from_le_bytes(buf[pos..pos + 2].try_into().ok()?) as usize;
+        pos += 2;
+        // num_blocks
+        let num_blocks = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
+        pos += 4;
+        // dict_size + dictionary
+        let dict_size = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
+        pos += 4 + dict_size;
+        // record_offsets
+        pos += num_words as usize * 4;
+        // block_index: (offset: u32, size: u32) × num_blocks
+        let block_index_start = pos;
+        pos += num_blocks * 8;
+        // compressed data: compute total from last block's offset + size
+        let total_compressed = if num_blocks > 0 {
+            let last_bi = block_index_start + (num_blocks - 1) * 8;
+            let last_offset =
+                u32::from_le_bytes(buf[last_bi..last_bi + 4].try_into().ok()?) as usize;
+            let last_size =
+                u32::from_le_bytes(buf[last_bi + 4..last_bi + 8].try_into().ok()?) as usize;
+            last_offset + last_size
+        } else {
+            0
+        };
+        pos += total_compressed;
+
+        Some(pos - offset)
+    }
+
+    /// Iterate over all words in this lexicon, yielding `(WordId, reading_form)`.
+    ///
+    /// Used to build the reverse reading index for IME support.
+    /// Only the `surface` and `reading_form` fields are fetched from each entry.
+    pub fn iter_reading_words(
+        &self,
+    ) -> impl Iterator<Item = (WordId, SudachiResult<WordInfo>)> + '_ {
+        let count = self.size();
+        (0..count).map(move |wid| {
+            let word_id = self.word_id(wid);
+            let info = self
+                .get_word_info(wid, InfoSubset::SURFACE | InfoSubset::READING_FORM | InfoSubset::DIC_FORM_WORD_ID);
+            (word_id, info)
+        })
     }
 }
 

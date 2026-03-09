@@ -224,10 +224,16 @@ impl<'a> WordInfos<'a> {
         }
 
         let ro_off = bc.record_offsets_start + word_id as usize * 4;
+        if ro_off + 4 > self.bytes.len() {
+            return Err(SudachiError::InvalidRange(ro_off, ro_off + 4));
+        }
         let record_offset = u32::from_le_bytes(
             self.bytes[ro_off..ro_off + 4].try_into().unwrap(),
         ) as usize;
 
+        if record_offset > cache.data.len() {
+            return Err(SudachiError::InvalidRange(record_offset, cache.data.len()));
+        }
         let parser = WordInfoParser::subset(subset);
         parser.parse(&cache.data[record_offset..])
     }
