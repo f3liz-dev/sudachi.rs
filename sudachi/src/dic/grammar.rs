@@ -95,16 +95,18 @@ impl<'a> Grammar<'a> {
 
         // Check for compressed connection matrix magic
         const COMPRESSED_MAGIC: u32 = 0x4D43_5A42; // "MCZB"
+        const COMPRESSED_DELTA_MAGIC: u32 = 0x4D43_5A44; // "MCZD" — delta-encoded
         let maybe_magic = if connect_table_offset + 4 <= buf.len() {
             u32::from_le_bytes(buf[connect_table_offset..connect_table_offset + 4].try_into().unwrap())
         } else {
             0
         };
 
-        if maybe_magic == COMPRESSED_MAGIC {
+        if maybe_magic == COMPRESSED_MAGIC || maybe_magic == COMPRESSED_DELTA_MAGIC {
+            let delta_encoded = maybe_magic == COMPRESSED_DELTA_MAGIC;
             // Compressed connection matrix
             let (conn, consumed) =
-                ConnectionMatrix::from_compressed(buf, connect_table_offset + 4)?;
+                ConnectionMatrix::from_compressed(buf, connect_table_offset + 4, delta_encoded)?;
             let storage_size = (connect_table_offset - offset) + 4 + consumed;
             Ok(Grammar {
                 _bytes: buf,
