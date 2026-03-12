@@ -80,39 +80,46 @@ impl<'a> ConnectionMatrix<'a> {
     }
 }
 
-/// Block-compressed connection matrix for the `marisa-trie` feature.
+#[cfg(feature = "marisa-trie")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompressionKind {
+    Uncompressed,
+    Bitpacked,
+    Zstd,
+}
+
+/// Connection matrix for the `marisa-trie` feature.
 ///
-/// Stores the matrix as bit-packed 256×256 blocks. Each block stores
-/// a minimum value and a bit-width, then packs `(value - min)` for every
-/// cell using exactly `bit_width` bits. This provides O(1) random access
-/// without any decompression cache or mutex.
-///
-/// Binary format (after the 4-byte magic in Grammar):
-/// ```text
-/// [num_left: u16][num_right: u16]
-/// [num_blocks: u32]
-/// [block_offsets: u32 × num_blocks]       — byte offset from data_start
-/// [block_data: ...]
-/// ```
-///
-/// Each block:
-/// ```text
-/// [min_val: i16][bit_width: u8][packed_data: ...]
-/// ```
+/// Supports three layouts:
+/// - flat uncompressed matrices from `DictBuilder`
+/// - bit-packed matrices (`MCBP`) from the current converter
+/// - zstd-compressed block matrices (`MCZB`) from the restored converter path
 #[cfg(feature = "marisa-trie")]
 pub struct ConnectionMatrix<'a> {
     buf: &'a [u8],
     num_left: usize,
     num_right: usize,
     num_col_blocks: usize,
-    block_offsets_start: usize,
+    index_start: usize,
     data_start: usize,
+    kind: CompressionKind,
+    cache: std::sync::Mutex<StripeCache>,
+}
+
+#[cfg(feature = "marisa-trie")]
+struct StripeCache {
+    row_block: usize,
+    data: Vec<i16>,
+    decoder: ruzstd::decoding::FrameDecoder,
 }
 
 #[cfg(feature = "marisa-trie")]
 impl<'a> ConnectionMatrix<'a> {
     /// Block size for bit-packing (256×256 cells per block).
     pub const BLOCK_SIZE: usize = 256;
+
+    /// zstd-compressed connection matrix magic: "MCZB"
+    pub const COMPRESSED_MAGIC: u32 = 0x4D43_5A42;
 
     /// Bit-packed connection matrix magic: "MCBP"
     pub const BITPACKED_MAGIC: u32 = 0x4D43_4250;
@@ -132,15 +139,25 @@ impl<'a> ConnectionMatrix<'a> {
             return Err(SudachiError::InvalidDictionaryGrammar.with_context("connection matrix"));
         }
 
-        // For uncompressed matrices, store as a single "block" with the
-        // raw i16 data accessible via special-case (num_col_blocks == 0).
+        let mut data = vec![0i16; size];
+        for (i, slot) in data.iter_mut().enumerate() {
+            let pos = offset + i * 2;
+            *slot = i16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap());
+        }
+
         Ok(ConnectionMatrix {
             buf,
             num_left,
             num_right,
             num_col_blocks: 0,
-            block_offsets_start: offset, // repurposed: raw data start
-            data_start: offset,
+            index_start: 0,
+            data_start: 0,
+            kind: CompressionKind::Uncompressed,
+            cache: std::sync::Mutex::new(StripeCache {
+                row_block: 0,
+                data,
+                decoder: ruzstd::decoding::FrameDecoder::new(),
+            }),
         })
     }
 
@@ -163,7 +180,7 @@ impl<'a> ConnectionMatrix<'a> {
         let num_blocks = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
-        let block_offsets_start = pos;
+        let index_start = pos;
         pos += num_blocks * 4; // u32 per block
         let data_start = pos;
 
@@ -173,7 +190,7 @@ impl<'a> ConnectionMatrix<'a> {
         // Find the end of block data
         let mut max_data_end = data_start;
         for bi in 0..num_blocks {
-            let bo_off = block_offsets_start + bi * 4;
+            let bo_off = index_start + bi * 4;
             let block_offset = u32::from_le_bytes(buf[bo_off..bo_off + 4].try_into().unwrap()) as usize;
             let abs_start = data_start + block_offset;
 
@@ -198,11 +215,179 @@ impl<'a> ConnectionMatrix<'a> {
                 num_left,
                 num_right,
                 num_col_blocks,
-                block_offsets_start,
+                index_start,
                 data_start,
+                kind: CompressionKind::Bitpacked,
+                cache: std::sync::Mutex::new(StripeCache {
+                    row_block: usize::MAX,
+                    data: Vec::new(),
+                    decoder: ruzstd::decoding::FrameDecoder::new(),
+                }),
             },
             consumed,
         ))
+    }
+
+    /// Read a zstd-compressed connection matrix from the dictionary.
+    pub fn from_compressed(
+        buf: &'a [u8],
+        offset: usize,
+    ) -> SudachiResult<(ConnectionMatrix<'a>, usize)> {
+        let mut pos = offset;
+
+        if pos + 4 > buf.len() {
+            return Err(
+                SudachiError::InvalidDictionaryGrammar.with_context("compressed conn header"),
+            );
+        }
+        let num_left = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+        let num_right = u16::from_le_bytes(buf[pos + 2..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        let num_blocks = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        if pos + 4 > buf.len() {
+            return Err(
+                SudachiError::InvalidDictionaryGrammar.with_context("compressed conn dict size"),
+            );
+        }
+        let dict_size = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + dict_size > buf.len() {
+            return Err(
+                SudachiError::InvalidDictionaryGrammar.with_context("compressed conn dictionary"),
+            );
+        }
+        let dict_bytes = &buf[pos..pos + dict_size];
+        pos += dict_size;
+
+        let dict = ruzstd::decoding::Dictionary::decode_dict(dict_bytes).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("connection matrix dict decode failed: {:?}", e),
+            )
+        })?;
+
+        let index_start = pos;
+        let index_size = num_blocks * 8;
+        if pos + index_size > buf.len() {
+            return Err(
+                SudachiError::InvalidDictionaryGrammar.with_context("compressed conn index"),
+            );
+        }
+        pos += index_size;
+        let data_start = pos;
+
+        let mut max_data_end = data_start;
+        for i in 0..num_blocks {
+            let idx_off = index_start + i * 8;
+            let blk_offset =
+                u32::from_le_bytes(buf[idx_off..idx_off + 4].try_into().unwrap()) as usize;
+            let blk_size =
+                u32::from_le_bytes(buf[idx_off + 4..idx_off + 8].try_into().unwrap()) as usize;
+            let abs_end = data_start + blk_offset + blk_size;
+            if abs_end > max_data_end {
+                max_data_end = abs_end;
+            }
+        }
+
+        let num_col_blocks = (num_left + Self::BLOCK_SIZE - 1) / Self::BLOCK_SIZE;
+
+        let mut decoder = ruzstd::decoding::FrameDecoder::new();
+        decoder.add_dict(dict).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("connection matrix add_dict failed: {:?}", e),
+            )
+        })?;
+
+        let cache = StripeCache {
+            row_block: usize::MAX,
+            data: vec![0i16; Self::BLOCK_SIZE * num_left],
+            decoder,
+        };
+
+        let consumed = max_data_end - offset;
+        Ok((
+            ConnectionMatrix {
+                buf,
+                num_left,
+                num_right,
+                num_col_blocks,
+                index_start,
+                data_start,
+                kind: CompressionKind::Zstd,
+                cache: std::sync::Mutex::new(cache),
+            },
+            consumed,
+        ))
+    }
+
+    fn load_row_stripe(
+        cache: &mut StripeCache,
+        buf: &[u8],
+        row_block: usize,
+        num_left: usize,
+        num_right: usize,
+        num_col_blocks: usize,
+        index_start: usize,
+        data_start: usize,
+    ) {
+        let bs = Self::BLOCK_SIZE;
+        let row_start = row_block * bs;
+        let row_end = std::cmp::min(row_start + bs, num_right);
+        let actual_rows = row_end - row_start;
+
+        for value in &mut cache.data[..actual_rows * num_left] {
+            *value = 0;
+        }
+
+        for cb in 0..num_col_blocks {
+            let blk_idx = row_block * num_col_blocks + cb;
+            let idx_off = index_start + blk_idx * 8;
+            let blk_offset = u32::from_le_bytes(buf[idx_off..idx_off + 4].try_into().unwrap())
+                as usize;
+            let blk_size =
+                u32::from_le_bytes(buf[idx_off + 4..idx_off + 8].try_into().unwrap()) as usize;
+
+            let abs_offset = data_start + blk_offset;
+            let compressed = &buf[abs_offset..abs_offset + blk_size];
+
+            let decompressed = {
+                use std::io::Read;
+                let mut cursor = std::io::Cursor::new(compressed);
+                cache.decoder.reset(&mut cursor).unwrap_or_else(|e| {
+                    panic!("connection matrix block {} zstd reset failed: {:?}", blk_idx, e);
+                });
+                cache
+                    .decoder
+                    .decode_blocks(&mut cursor, ruzstd::decoding::BlockDecodingStrategy::All)
+                    .unwrap_or_else(|e| {
+                        panic!("connection matrix block {} zstd decode failed: {:?}", blk_idx, e);
+                    });
+                let mut out = Vec::new();
+                cache.decoder.read_to_end(&mut out).unwrap_or_else(|e| {
+                    panic!("connection matrix block {} zstd collect failed: {}", blk_idx, e);
+                });
+                out
+            };
+
+            let col_start = cb * bs;
+            let col_end = std::cmp::min(col_start + bs, num_left);
+            let mut src = 0;
+            for local_r in 0..actual_rows {
+                for c in col_start..col_end {
+                    if src + 2 <= decompressed.len() {
+                        cache.data[local_r * num_left + c] =
+                            i16::from_le_bytes(decompressed[src..src + 2].try_into().unwrap());
+                    }
+                    src += 2;
+                }
+            }
+        }
+
+        cache.row_block = row_block;
     }
 
     #[inline(always)]
@@ -212,51 +397,107 @@ impl<'a> ConnectionMatrix<'a> {
         debug_assert!(uleft < self.num_left);
         debug_assert!(uright < self.num_right);
 
-        // Uncompressed fallback (num_col_blocks == 0)
-        if self.num_col_blocks == 0 {
-            let index = uright * self.num_left + uleft;
-            let pos = self.data_start + index * 2;
-            return i16::from_le_bytes(self.buf[pos..pos + 2].try_into().unwrap());
+        match self.kind {
+            CompressionKind::Uncompressed => {
+                let index = uright * self.num_left + uleft;
+                let cache = self.cache.lock().unwrap();
+                cache.data.get(index).copied().unwrap_or(0)
+            }
+            CompressionKind::Bitpacked => {
+                let col_block = uleft / Self::BLOCK_SIZE;
+                let row_block = uright / Self::BLOCK_SIZE;
+                let local_col = uleft % Self::BLOCK_SIZE;
+                let local_row = uright % Self::BLOCK_SIZE;
+
+                let actual_cols = std::cmp::min(
+                    Self::BLOCK_SIZE,
+                    self.num_left - col_block * Self::BLOCK_SIZE,
+                );
+
+                let block_idx = row_block * self.num_col_blocks + col_block;
+                let bo_off = self.index_start + block_idx * 4;
+                let block_offset =
+                    u32::from_le_bytes(self.buf[bo_off..bo_off + 4].try_into().unwrap()) as usize;
+                let abs_start = self.data_start + block_offset;
+
+                let min_val =
+                    i16::from_le_bytes(self.buf[abs_start..abs_start + 2].try_into().unwrap());
+                let bit_width = self.buf[abs_start + 2];
+
+                if bit_width == 0 {
+                    return min_val;
+                }
+
+                let cell_index = local_row * actual_cols + local_col;
+                let bit_offset = cell_index * bit_width as usize;
+                let packed_start = abs_start + 3;
+                let extracted = crate::dic::compact::extract_bits(
+                    &self.buf[packed_start..],
+                    bit_offset,
+                    bit_width,
+                );
+                min_val.wrapping_add(extracted as i16)
+            }
+            CompressionKind::Zstd => {
+                let row_block = uright / Self::BLOCK_SIZE;
+                let local_row = uright % Self::BLOCK_SIZE;
+
+                let mut cache = self.cache.lock().unwrap();
+                if cache.row_block != row_block {
+                    Self::load_row_stripe(
+                        &mut cache,
+                        self.buf,
+                        row_block,
+                        self.num_left,
+                        self.num_right,
+                        self.num_col_blocks,
+                        self.index_start,
+                        self.data_start,
+                    );
+                }
+
+                let index = local_row * self.num_left + uleft;
+                cache.data.get(index).copied().unwrap_or(0)
+            }
         }
-
-        let col_block = uleft / Self::BLOCK_SIZE;
-        let row_block = uright / Self::BLOCK_SIZE;
-        let local_col = uleft % Self::BLOCK_SIZE;
-        let local_row = uright % Self::BLOCK_SIZE;
-
-        let actual_cols = std::cmp::min(
-            Self::BLOCK_SIZE,
-            self.num_left - col_block * Self::BLOCK_SIZE,
-        );
-
-        let block_idx = row_block * self.num_col_blocks + col_block;
-        let bo_off = self.block_offsets_start + block_idx * 4;
-        let block_offset = u32::from_le_bytes(
-            self.buf[bo_off..bo_off + 4].try_into().unwrap(),
-        ) as usize;
-        let abs_start = self.data_start + block_offset;
-
-        let min_val = i16::from_le_bytes(self.buf[abs_start..abs_start + 2].try_into().unwrap());
-        let bit_width = self.buf[abs_start + 2];
-
-        if bit_width == 0 {
-            return min_val;
-        }
-
-        let cell_index = local_row * actual_cols + local_col;
-        let bit_offset = cell_index * bit_width as usize;
-        let packed_start = abs_start + 3;
-        let extracted = crate::dic::compact::extract_bits(
-            &self.buf[packed_start..],
-            bit_offset,
-            bit_width,
-        );
-        min_val.wrapping_add(extracted as i16)
     }
 
-    pub fn update(&mut self, _left: u16, _right: u16, _value: i16) {
-        // Bit-packed matrices are read-only; update is a no-op.
-        // This method exists for API compatibility.
+    pub fn update(&mut self, left: u16, right: u16, value: i16) {
+        match self.kind {
+            CompressionKind::Uncompressed => {
+                let index = right as usize * self.num_left + left as usize;
+                let mut cache = self.cache.lock().unwrap();
+                if index < cache.data.len() {
+                    cache.data[index] = value;
+                }
+            }
+            CompressionKind::Bitpacked => {}
+            CompressionKind::Zstd => {
+                let uleft = left as usize;
+                let uright = right as usize;
+                let row_block = uright / Self::BLOCK_SIZE;
+                let local_row = uright % Self::BLOCK_SIZE;
+
+                let mut cache = self.cache.lock().unwrap();
+                if cache.row_block != row_block {
+                    Self::load_row_stripe(
+                        &mut cache,
+                        self.buf,
+                        row_block,
+                        self.num_left,
+                        self.num_right,
+                        self.num_col_blocks,
+                        self.index_start,
+                        self.data_start,
+                    );
+                }
+
+                let index = local_row * self.num_left + uleft;
+                if index < cache.data.len() {
+                    cache.data[index] = value;
+                }
+            }
+        }
     }
 
     pub fn num_left(&self) -> usize {
