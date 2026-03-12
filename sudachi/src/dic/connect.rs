@@ -84,16 +84,14 @@ impl<'a> ConnectionMatrix<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompressionKind {
     Uncompressed,
-    Bitpacked,
     Zstd,
 }
 
 /// Connection matrix for the `marisa-trie` feature.
 ///
-/// Supports three layouts:
+/// Supports two layouts:
 /// - flat uncompressed matrices from `DictBuilder`
-/// - bit-packed matrices (`MCBP`) from the current converter
-/// - zstd-compressed block matrices (`MCZB`) from the restored converter path
+/// - zstd-compressed block matrices (`MCZB`) from `dic_converter`
 #[cfg(feature = "marisa-trie")]
 pub struct ConnectionMatrix<'a> {
     buf: &'a [u8],
@@ -115,14 +113,11 @@ struct StripeCache {
 
 #[cfg(feature = "marisa-trie")]
 impl<'a> ConnectionMatrix<'a> {
-    /// Block size for bit-packing (256×256 cells per block).
+    /// Block size for compressed matrices (256×256 cells per block).
     pub const BLOCK_SIZE: usize = 256;
 
     /// zstd-compressed connection matrix magic: "MCZB"
     pub const COMPRESSED_MAGIC: u32 = 0x4D43_5A42;
-
-    /// Bit-packed connection matrix magic: "MCBP"
-    pub const BITPACKED_MAGIC: u32 = 0x4D43_4250;
 
     /// Read the flat (uncompressed) connection matrix — used when loading
     /// dictionaries that have NOT been converted (e.g., dictionaries built
@@ -161,73 +156,6 @@ impl<'a> ConnectionMatrix<'a> {
         })
     }
 
-    /// Read a bit-packed connection matrix from the dictionary.
-    ///
-    /// No data is decoded eagerly — values are extracted on demand via `cost()`.
-    pub fn from_bitpacked(
-        buf: &'a [u8],
-        offset: usize,
-    ) -> SudachiResult<(ConnectionMatrix<'a>, usize)> {
-        let mut pos = offset;
-
-        if pos + 4 > buf.len() {
-            return Err(SudachiError::InvalidDictionaryGrammar.with_context("bitpacked conn header"));
-        }
-        let num_left = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
-        let num_right = u16::from_le_bytes(buf[pos + 2..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-
-        let num_blocks = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-
-        let index_start = pos;
-        pos += num_blocks * 4; // u32 per block
-        let data_start = pos;
-
-        // Compute total size by finding max(block_offset + block_size) across all blocks
-        let num_col_blocks = (num_left + Self::BLOCK_SIZE - 1) / Self::BLOCK_SIZE;
-
-        // Find the end of block data
-        let mut max_data_end = data_start;
-        for bi in 0..num_blocks {
-            let bo_off = index_start + bi * 4;
-            let block_offset = u32::from_le_bytes(buf[bo_off..bo_off + 4].try_into().unwrap()) as usize;
-            let abs_start = data_start + block_offset;
-
-            // Parse block header to compute block data size
-            let bit_width = buf[abs_start + 2];
-            let rb = bi / num_col_blocks;
-            let cb = bi % num_col_blocks;
-            let actual_rows = std::cmp::min(Self::BLOCK_SIZE, num_right.saturating_sub(rb * Self::BLOCK_SIZE));
-            let actual_cols = std::cmp::min(Self::BLOCK_SIZE, num_left.saturating_sub(cb * Self::BLOCK_SIZE));
-            let total_bits = actual_rows * actual_cols * bit_width as usize;
-            let packed_bytes = (total_bits + 7) / 8;
-            let block_end = abs_start + 3 + packed_bytes; // 2 (min_val) + 1 (bit_width) + packed
-            if block_end > max_data_end {
-                max_data_end = block_end;
-            }
-        }
-
-        let consumed = max_data_end - offset;
-        Ok((
-            ConnectionMatrix {
-                buf,
-                num_left,
-                num_right,
-                num_col_blocks,
-                index_start,
-                data_start,
-                kind: CompressionKind::Bitpacked,
-                cache: std::sync::Mutex::new(StripeCache {
-                    row_block: usize::MAX,
-                    data: Vec::new(),
-                    decoder: ruzstd::decoding::FrameDecoder::new(),
-                }),
-            },
-            consumed,
-        ))
-    }
-
     /// Read a zstd-compressed connection matrix from the dictionary.
     pub fn from_compressed(
         buf: &'a [u8],
@@ -262,13 +190,6 @@ impl<'a> ConnectionMatrix<'a> {
         let dict_bytes = &buf[pos..pos + dict_size];
         pos += dict_size;
 
-        let dict = ruzstd::decoding::Dictionary::decode_dict(dict_bytes).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("connection matrix dict decode failed: {:?}", e),
-            )
-        })?;
-
         let index_start = pos;
         let index_size = num_blocks * 8;
         if pos + index_size > buf.len() {
@@ -295,12 +216,20 @@ impl<'a> ConnectionMatrix<'a> {
         let num_col_blocks = (num_left + Self::BLOCK_SIZE - 1) / Self::BLOCK_SIZE;
 
         let mut decoder = ruzstd::decoding::FrameDecoder::new();
-        decoder.add_dict(dict).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("connection matrix add_dict failed: {:?}", e),
-            )
-        })?;
+        if dict_size > 0 {
+            let dict = ruzstd::decoding::Dictionary::decode_dict(dict_bytes).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("connection matrix dict decode failed: {:?}", e),
+                )
+            })?;
+            decoder.add_dict(dict).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("connection matrix add_dict failed: {:?}", e),
+                )
+            })?;
+        }
 
         let cache = StripeCache {
             row_block: usize::MAX,
@@ -403,41 +332,6 @@ impl<'a> ConnectionMatrix<'a> {
                 let cache = self.cache.lock().unwrap();
                 cache.data.get(index).copied().unwrap_or(0)
             }
-            CompressionKind::Bitpacked => {
-                let col_block = uleft / Self::BLOCK_SIZE;
-                let row_block = uright / Self::BLOCK_SIZE;
-                let local_col = uleft % Self::BLOCK_SIZE;
-                let local_row = uright % Self::BLOCK_SIZE;
-
-                let actual_cols = std::cmp::min(
-                    Self::BLOCK_SIZE,
-                    self.num_left - col_block * Self::BLOCK_SIZE,
-                );
-
-                let block_idx = row_block * self.num_col_blocks + col_block;
-                let bo_off = self.index_start + block_idx * 4;
-                let block_offset =
-                    u32::from_le_bytes(self.buf[bo_off..bo_off + 4].try_into().unwrap()) as usize;
-                let abs_start = self.data_start + block_offset;
-
-                let min_val =
-                    i16::from_le_bytes(self.buf[abs_start..abs_start + 2].try_into().unwrap());
-                let bit_width = self.buf[abs_start + 2];
-
-                if bit_width == 0 {
-                    return min_val;
-                }
-
-                let cell_index = local_row * actual_cols + local_col;
-                let bit_offset = cell_index * bit_width as usize;
-                let packed_start = abs_start + 3;
-                let extracted = crate::dic::compact::extract_bits(
-                    &self.buf[packed_start..],
-                    bit_offset,
-                    bit_width,
-                );
-                min_val.wrapping_add(extracted as i16)
-            }
             CompressionKind::Zstd => {
                 let row_block = uright / Self::BLOCK_SIZE;
                 let local_row = uright % Self::BLOCK_SIZE;
@@ -471,7 +365,6 @@ impl<'a> ConnectionMatrix<'a> {
                     cache.data[index] = value;
                 }
             }
-            CompressionKind::Bitpacked => {}
             CompressionKind::Zstd => {
                 let uleft = left as usize;
                 let uright = right as usize;

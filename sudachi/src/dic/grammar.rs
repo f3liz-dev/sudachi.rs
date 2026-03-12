@@ -82,9 +82,9 @@ impl<'a> Grammar<'a> {
 
     /// Creates a Grammar from dictionary bytes (MARISA variant).
     ///
-    /// Supports uncompressed matrices (from DictBuilder), zstd-compressed
-    /// matrices (`MCZB`), and bit-packed matrices (`MCBP`) produced by
-    /// different converter revisions.
+    /// Supports uncompressed matrices (from DictBuilder) and zstd-compressed
+    /// matrices (`MCZB`). Older bit-packed (`MCBP`) and delta-compressed
+    /// (`MCZD`) converter revisions are rejected.
     #[cfg(feature = "marisa-trie")]
     pub fn parse(buf: &[u8], offset: usize) -> SudachiResult<Grammar> {
         let (rest, (pos_list, left_id_size, right_id_size)) = grammar_parser(buf, offset)
@@ -113,16 +113,9 @@ impl<'a> Grammar<'a> {
                 character_category: CharacterCategory::default(),
             })
         } else if maybe_magic == BITPACKED_MAGIC {
-            let (conn, consumed) =
-                ConnectionMatrix::from_bitpacked(buf, connect_table_offset + 4)?;
-            let storage_size = (connect_table_offset - offset) + 4 + consumed;
-            Ok(Grammar {
-                _bytes: buf,
-                pos_list,
-                connection: conn,
-                storage_size,
-                character_category: CharacterCategory::default(),
-            })
+            Err(SudachiError::InvalidDictionaryGrammar.with_context(
+                "bit-packed connection matrices are no longer supported",
+            ))
         } else if maybe_magic == COMPRESSED_DELTA_MAGIC {
             Err(SudachiError::InvalidDictionaryGrammar.with_context(
                 "delta-compressed connection matrices are no longer supported",
@@ -230,6 +223,40 @@ impl<'a> Grammar<'a> {
     /// Only pos_list is merged
     pub fn merge(&mut self, other: Grammar) {
         self.pos_list.extend(other.pos_list);
+    }
+}
+
+#[cfg(all(test, feature = "marisa-trie"))]
+mod regression_tests {
+    use super::Grammar;
+
+    fn grammar_with_magic(magic: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&(1i16).to_le_bytes());
+        buf.extend_from_slice(&(1i16).to_le_bytes());
+        buf.extend_from_slice(&magic.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn rejects_bitpacked_connection_matrix() {
+        let err = Grammar::parse(&grammar_with_magic(0x4D43_4250), 0)
+            .err()
+            .unwrap();
+        assert!(err
+            .to_string()
+            .contains("bit-packed connection matrices are no longer supported"));
+    }
+
+    #[test]
+    fn rejects_delta_compressed_connection_matrix() {
+        let err = Grammar::parse(&grammar_with_magic(0x4D43_5A44), 0)
+            .err()
+            .unwrap();
+        assert!(err
+            .to_string()
+            .contains("delta-compressed connection matrices are no longer supported"));
     }
 }
 

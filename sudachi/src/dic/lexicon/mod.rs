@@ -106,7 +106,7 @@ impl<'a> Lexicon<'a> {
         let word_params = WordParams::new(buf, word_params_size, offset + 4);
         offset += word_params.storage_size();
 
-        let word_infos = WordInfos::new(buf, offset, word_params.size(), has_synonym_group_ids);
+        let word_infos = WordInfos::new(buf, offset, word_params.size(), has_synonym_group_ids)?;
 
         Ok(Lexicon {
             trie,
@@ -138,7 +138,7 @@ impl<'a> Lexicon<'a> {
         offset += word_params.storage_size();
 
         let word_infos_offset = offset;
-        let word_infos = WordInfos::new(buf, offset, word_params.size(), has_synonym_group_ids);
+        let word_infos = WordInfos::new(buf, offset, word_params.size(), has_synonym_group_ids)?;
 
         // Try to detect and load reading trie after word_infos section.
         // Compute word_infos section size, then check for RTRI magic.
@@ -266,35 +266,47 @@ impl<'a> Lexicon<'a> {
         }
     }
 
-    /// Compute the total byte size of a VByte-encoded word_infos section.
+    /// Compute the total byte size of a block-compressed word_infos section.
     #[cfg(feature = "marisa-trie")]
     fn compute_word_infos_size(
         buf: &[u8],
         offset: usize,
-        _num_words: u32,
+        num_words: u32,
     ) -> Option<usize> {
-        const VBYTE_WI_MAGIC: u32 = 0x4D57_5642; // "MWVB"
+        const BLOCK_WI_MAGIC: u32 = 0x4D57_4942; // "MWIB"
 
         if offset + 4 > buf.len() {
             return None;
         }
         let magic = u32::from_le_bytes(buf[offset..offset + 4].try_into().ok()?);
-        if magic != VBYTE_WI_MAGIC {
+        if magic != BLOCK_WI_MAGIC {
             // Uncompressed word_infos — extends to end of buffer (no reading trie)
             return None;
         }
 
         let mut pos = offset + 4;
-        // num_words
-        let nw = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
+        let _nw = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
         pos += 4;
-        // data_size
-        let data_size = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
+        let _records_per_block = u16::from_le_bytes(buf[pos..pos + 2].try_into().ok()?) as usize;
+        pos += 2;
+        let num_blocks = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
         pos += 4;
-        // record_offsets: u32 × num_words
-        pos += nw * 4;
-        // record_data
-        pos += data_size;
+        let dict_size = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
+        pos += 4 + dict_size;
+        pos += num_words as usize * 4;
+        let block_index_start = pos;
+        pos += num_blocks * 8;
+        let total_compressed = if num_blocks > 0 {
+            let last_bi = block_index_start + (num_blocks - 1) * 8;
+            let last_offset =
+                u32::from_le_bytes(buf[last_bi..last_bi + 4].try_into().ok()?) as usize;
+            let last_size =
+                u32::from_le_bytes(buf[last_bi + 4..last_bi + 8].try_into().ok()?) as usize;
+            last_offset + last_size
+        } else {
+            0
+        };
+        pos += total_compressed;
 
         Some(pos - offset)
     }

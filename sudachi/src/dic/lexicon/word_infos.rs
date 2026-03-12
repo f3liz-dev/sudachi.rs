@@ -23,7 +23,9 @@ use crate::dic::subset::InfoSubset;
 use crate::dic::word_id::WordId;
 use crate::prelude::*;
 
-/// Magic marker for VByte-encoded word_infos (MARISA converted dictionaries).
+/// Magic marker for block-compressed word_infos (MARISA converted dictionaries).
+#[cfg(feature = "marisa-trie")]
+const BLOCK_WI_MAGIC: u32 = 0x4D57_4942; // "MWIB"
 #[cfg(feature = "marisa-trie")]
 const VBYTE_WI_MAGIC: u32 = 0x4D57_5642; // "MWVB"
 
@@ -33,18 +35,29 @@ pub struct WordInfos<'a> {
     _word_size: u32,
     has_synonym_group_ids: bool,
     #[cfg(feature = "marisa-trie")]
-    vbyte_info: Option<VByteWordInfos>,
+    block_compressed: Option<BlockCompressedInfo>,
 }
 
-/// VByte-encoded word_infos.
+/// Block-compressed word_infos.
 ///
-/// Records are stored flat with VByte-encoded integer/array fields.
-/// Each record is accessed directly via a u32 offset table — no block
-/// cache or decompression needed.
+/// Records are grouped into zstd-compressed blocks with per-record
+/// intra-block offsets. A single-entry cache avoids redundant block
+/// decompression for sequential access patterns.
 #[cfg(feature = "marisa-trie")]
-struct VByteWordInfos {
+struct BlockCompressedInfo {
     record_offsets_start: usize,
-    record_data_start: usize,
+    records_per_block: usize,
+    num_blocks: usize,
+    block_index_start: usize,
+    compressed_data_start: usize,
+    cache: std::sync::Mutex<BlockCache>,
+}
+
+#[cfg(feature = "marisa-trie")]
+struct BlockCache {
+    block_idx: usize,
+    data: Vec<u8>,
+    decoder: ruzstd::decoding::FrameDecoder,
 }
 
 impl<'a> WordInfos<'a> {
@@ -53,7 +66,7 @@ impl<'a> WordInfos<'a> {
         offset: usize,
         _word_size: u32,
         has_synonym_group_ids: bool,
-    ) -> WordInfos<'a> {
+    ) -> SudachiResult<WordInfos<'a>> {
         #[cfg(feature = "marisa-trie")]
         {
             let maybe_magic = if offset + 4 <= bytes.len() {
@@ -62,49 +75,100 @@ impl<'a> WordInfos<'a> {
                 0
             };
 
-            if maybe_magic == VBYTE_WI_MAGIC {
+            if maybe_magic == BLOCK_WI_MAGIC {
                 let mut off = offset + 4;
-                let num_words =
-                    u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+                if off + 4 > bytes.len() {
+                    return Err(SudachiError::InvalidRange(off, off + 4));
+                }
+                let num_words = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
                 off += 4;
-                // data_size: total byte size of the record data section
-                let _data_size =
-                    u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+                if off + 2 > bytes.len() {
+                    return Err(SudachiError::InvalidRange(off, off + 2));
+                }
+                let records_per_block =
+                    u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap()) as usize;
+                off += 2;
+                if off + 4 > bytes.len() {
+                    return Err(SudachiError::InvalidRange(off, off + 4));
+                }
+                let num_blocks = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
                 off += 4;
+                if off + 4 > bytes.len() {
+                    return Err(SudachiError::InvalidRange(off, off + 4));
+                }
+                let dict_size = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+                off += 4;
+                let dict_end = off + dict_size;
+                if dict_end > bytes.len() {
+                    return Err(SudachiError::InvalidRange(off, dict_end));
+                }
+                let dict_bytes = &bytes[off..dict_end];
+                off = dict_end;
+
+                let mut decoder = ruzstd::decoding::FrameDecoder::new();
+                if dict_size > 0 {
+                    let dict = ruzstd::decoding::Dictionary::decode_dict(dict_bytes).map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("word_infos dict decode failed: {:?}", e),
+                        )
+                    })?;
+                    decoder.add_dict(dict).map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("word_infos add_dict failed: {:?}", e),
+                        )
+                    })?;
+                }
 
                 let record_offsets_start = off;
                 off += num_words * 4;
+                let block_index_start = off;
+                off += num_blocks * 8;
+                let compressed_data_start = off;
 
-                let record_data_start = off;
-
-                return WordInfos {
+                return Ok(WordInfos {
                     bytes,
                     offset,
                     _word_size: num_words as u32,
                     has_synonym_group_ids,
-                    vbyte_info: Some(VByteWordInfos {
+                    block_compressed: Some(BlockCompressedInfo {
                         record_offsets_start,
-                        record_data_start,
+                        records_per_block,
+                        num_blocks,
+                        block_index_start,
+                        compressed_data_start,
+                        cache: std::sync::Mutex::new(BlockCache {
+                            block_idx: usize::MAX,
+                            data: Vec::new(),
+                            decoder,
+                        }),
                     }),
-                };
+                });
             }
 
-            return WordInfos {
+            if maybe_magic == VBYTE_WI_MAGIC {
+                return Err(SudachiError::InvalidDictionaryGrammar.with_context(
+                    "VByte-encoded word infos are no longer supported",
+                ));
+            }
+
+            return Ok(WordInfos {
                 bytes,
                 offset,
                 _word_size,
                 has_synonym_group_ids,
-                vbyte_info: None,
-            };
+                block_compressed: None,
+            });
         }
 
         #[cfg(not(feature = "marisa-trie"))]
-        WordInfos {
+        Ok(WordInfos {
             bytes,
             offset,
             _word_size,
             has_synonym_group_ids,
-        }
+        })
     }
 
     fn word_id_to_offset(&self, word_id: u32) -> SudachiResult<usize> {
@@ -113,8 +177,8 @@ impl<'a> WordInfos<'a> {
 
     fn parse_word_info(&self, word_id: u32, subset: InfoSubset) -> SudachiResult<WordInfoData> {
         #[cfg(feature = "marisa-trie")]
-        if let Some(ref vb) = self.vbyte_info {
-            return self.parse_word_info_vbyte(vb, word_id, subset);
+        if let Some(ref bc) = self.block_compressed {
+            return self.parse_word_info_block(bc, word_id, subset);
         }
 
         let index = self.word_id_to_offset(word_id)?;
@@ -122,31 +186,80 @@ impl<'a> WordInfos<'a> {
         parser.parse(&self.bytes[index..])
     }
 
-    /// Parse a word_info record from a VByte-encoded section.
+    /// Parse a word_info record from a block-compressed section.
     ///
-    /// Looks up the record offset from the offset table, then parses
-    /// directly from the flat buffer using the VByte-aware parser.
+    /// Finds the block containing `word_id`, decompresses it if needed,
+    /// then parses the record at the stored intra-block offset.
     #[cfg(feature = "marisa-trie")]
-    fn parse_word_info_vbyte(
+    fn parse_word_info_block(
         &self,
-        vb: &VByteWordInfos,
+        bc: &BlockCompressedInfo,
         word_id: u32,
         subset: InfoSubset,
     ) -> SudachiResult<WordInfoData> {
-        let ro_off = vb.record_offsets_start + word_id as usize * 4;
+        let block_idx = word_id as usize / bc.records_per_block;
+        if block_idx >= bc.num_blocks {
+            return Err(SudachiError::InvalidRange(block_idx, bc.num_blocks));
+        }
+
+        let mut cache = bc.cache.lock().map_err(|_| {
+            SudachiError::from(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "word_info cache lock poisoned",
+            ))
+        })?;
+
+        if cache.block_idx != block_idx {
+            let bi_off = bc.block_index_start + block_idx * 8;
+            let block_offset =
+                u32::from_le_bytes(self.bytes[bi_off..bi_off + 4].try_into().unwrap()) as usize;
+            let block_size =
+                u32::from_le_bytes(self.bytes[bi_off + 4..bi_off + 8].try_into().unwrap()) as usize;
+
+            let compressed = &self.bytes[bc.compressed_data_start + block_offset
+                ..bc.compressed_data_start + block_offset + block_size];
+
+            cache.data = {
+                use std::io::Read;
+                let mut cursor = std::io::Cursor::new(compressed);
+                cache.decoder.reset(&mut cursor).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("word_info block zstd init error: {:?}", e),
+                    )
+                })?;
+                cache
+                    .decoder
+                    .decode_blocks(&mut cursor, ruzstd::decoding::BlockDecodingStrategy::All)
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("word_info block zstd decode error: {:?}", e),
+                        )
+                    })?;
+                let mut buf = Vec::new();
+                cache.decoder.read_to_end(&mut buf).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("word_info block zstd collect error: {}", e),
+                    )
+                })?;
+                buf
+            };
+            cache.block_idx = block_idx;
+        }
+
+        let ro_off = bc.record_offsets_start + word_id as usize * 4;
         if ro_off + 4 > self.bytes.len() {
             return Err(SudachiError::InvalidRange(ro_off, ro_off + 4));
         }
-        let record_offset = u32::from_le_bytes(
-            self.bytes[ro_off..ro_off + 4].try_into().unwrap(),
-        ) as usize;
-
-        let abs_offset = vb.record_data_start + record_offset;
-        if abs_offset >= self.bytes.len() {
-            return Err(SudachiError::InvalidRange(abs_offset, self.bytes.len()));
+        let record_offset =
+            u32::from_le_bytes(self.bytes[ro_off..ro_off + 4].try_into().unwrap()) as usize;
+        if record_offset > cache.data.len() {
+            return Err(SudachiError::InvalidRange(record_offset, cache.data.len()));
         }
         let parser = WordInfoParser::subset(subset);
-        parser.parse_vbyte(&self.bytes[abs_offset..])
+        parser.parse(&cache.data[record_offset..])
     }
 
     pub fn get_word_info(&self, word_id: u32, mut subset: InfoSubset) -> SudachiResult<WordInfo> {
@@ -298,3 +411,17 @@ impl Iterator for SplitIter<'_> {
 }
 
 impl FusedIterator for SplitIter<'_> {}
+
+#[cfg(all(test, feature = "marisa-trie"))]
+mod tests {
+    use super::WordInfos;
+
+    #[test]
+    fn rejects_vbyte_word_infos() {
+        let bytes = 0x4D57_5642u32.to_le_bytes();
+        let err = WordInfos::new(&bytes, 0, 0, false).err().unwrap();
+        assert!(err
+            .to_string()
+            .contains("VByte-encoded word infos are no longer supported"));
+    }
+}
