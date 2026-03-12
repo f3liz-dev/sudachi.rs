@@ -17,6 +17,7 @@
 use crate::dic::lexicon::word_infos::WordInfoData;
 use crate::dic::read::u16str::*;
 use crate::dic::read::{skip_u32_array, skip_wid_array, u32_array_parser, u32_wid_array_parser};
+use crate::dic::read::{skip_vbyte_u32_array, skip_vbyte_wid_array, vbyte_u16, vbyte_u32_array, vbyte_wid_array, zigzag_vbyte_i32};
 use crate::dic::subset::InfoSubset;
 use crate::error::SudachiResult;
 use nom::number::complete::{le_i32, le_u16};
@@ -154,6 +155,95 @@ impl WordInfoParser {
             InfoSubset::SYNONYM_GROUP_ID,
             u32_array_parser,
             skip_u32_array
+        );
+        Ok(self.info)
+    }
+
+    /// Parse a VByte-encoded word_info record.
+    ///
+    /// Same field order as `parse()`, but pos_id uses VByte,
+    /// dictionary_form_word_id uses ZigZag+VByte, and arrays use
+    /// VByte-encoded counts and elements.
+    #[cfg(feature = "marisa-trie")]
+    #[inline]
+    pub fn parse_vbyte(mut self, data: &[u8]) -> SudachiResult<WordInfoData> {
+        // surface: unchanged (1-2 byte len + UTF-16 data)
+        parse_field!(
+            self,
+            data,
+            surface,
+            InfoSubset::SURFACE,
+            utf16_string_parser,
+            skip_u16_string
+        );
+        // head_word_length: unchanged (1-2 byte string_length format)
+        parse_field!(
+            self,
+            data,
+            head_word_length,
+            InfoSubset::HEAD_WORD_LENGTH,
+            string_length_parser
+        );
+        // pos_id: VByte
+        parse_field!(self, data, pos_id, InfoSubset::POS_ID, vbyte_u16);
+        // normalized_form: unchanged
+        parse_field!(
+            self,
+            data,
+            normalized_form,
+            InfoSubset::NORMALIZED_FORM,
+            utf16_string_parser,
+            skip_u16_string
+        );
+        // dictionary_form_word_id: ZigZag + VByte
+        parse_field!(
+            self,
+            data,
+            dictionary_form_word_id,
+            InfoSubset::DIC_FORM_WORD_ID,
+            zigzag_vbyte_i32
+        );
+        // reading_form: unchanged
+        parse_field!(
+            self,
+            data,
+            reading_form,
+            InfoSubset::READING_FORM,
+            utf16_string_parser,
+            skip_u16_string
+        );
+        // arrays: VByte-encoded count + VByte-encoded elements
+        parse_field!(
+            self,
+            data,
+            a_unit_split,
+            InfoSubset::SPLIT_A,
+            vbyte_wid_array,
+            skip_vbyte_wid_array
+        );
+        parse_field!(
+            self,
+            data,
+            b_unit_split,
+            InfoSubset::SPLIT_B,
+            vbyte_wid_array,
+            skip_vbyte_wid_array
+        );
+        parse_field!(
+            self,
+            data,
+            word_structure,
+            InfoSubset::WORD_STRUCTURE,
+            vbyte_wid_array,
+            skip_vbyte_wid_array
+        );
+        parse_field!(
+            self,
+            data,
+            synonym_group_ids,
+            InfoSubset::SYNONYM_GROUP_ID,
+            vbyte_u32_array,
+            skip_vbyte_u32_array
         );
         Ok(self.info)
     }

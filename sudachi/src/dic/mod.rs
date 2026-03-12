@@ -32,6 +32,7 @@ use crate::prelude::*;
 pub mod build;
 pub mod category_type;
 pub mod character_category;
+pub mod compact;
 pub mod connect;
 pub mod dictionary;
 pub mod grammar;

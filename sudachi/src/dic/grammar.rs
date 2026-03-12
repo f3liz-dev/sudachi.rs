@@ -83,9 +83,9 @@ impl<'a> Grammar<'a> {
     /// Creates a Grammar from dictionary bytes (MARISA variant).
     ///
     /// Supports both uncompressed matrices (from DictBuilder) and
-    /// block-compressed matrices (from dic_converter). A compressed
-    /// matrix is identified by the magic `0x4D435A42` ("MCZB") at the
-    /// start of the connection-table area.
+    /// bit-packed matrices (from dic_converter). A bit-packed matrix
+    /// is identified by the magic `0x4D434250` ("MCBP") at the start
+    /// of the connection-table area.
     #[cfg(feature = "marisa-trie")]
     pub fn parse(buf: &[u8], offset: usize) -> SudachiResult<Grammar> {
         let (rest, (pos_list, left_id_size, right_id_size)) = grammar_parser(buf, offset)
@@ -93,20 +93,18 @@ impl<'a> Grammar<'a> {
 
         let connect_table_offset = buf.len() - rest.len();
 
-        // Check for compressed connection matrix magic
-        const COMPRESSED_MAGIC: u32 = 0x4D43_5A42; // "MCZB"
-        const COMPRESSED_DELTA_MAGIC: u32 = 0x4D43_5A44; // "MCZD" — delta-encoded
+        // Check for bit-packed connection matrix magic
+        const BITPACKED_MAGIC: u32 = 0x4D43_4250; // "MCBP"
         let maybe_magic = if connect_table_offset + 4 <= buf.len() {
             u32::from_le_bytes(buf[connect_table_offset..connect_table_offset + 4].try_into().unwrap())
         } else {
             0
         };
 
-        if maybe_magic == COMPRESSED_MAGIC || maybe_magic == COMPRESSED_DELTA_MAGIC {
-            let delta_encoded = maybe_magic == COMPRESSED_DELTA_MAGIC;
-            // Compressed connection matrix
+        if maybe_magic == BITPACKED_MAGIC {
+            // Bit-packed connection matrix
             let (conn, consumed) =
-                ConnectionMatrix::from_compressed(buf, connect_table_offset + 4, delta_encoded)?;
+                ConnectionMatrix::from_bitpacked(buf, connect_table_offset + 4)?;
             let storage_size = (connect_table_offset - offset) + 4 + consumed;
             Ok(Grammar {
                 _bytes: buf,
