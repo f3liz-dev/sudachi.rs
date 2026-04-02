@@ -47,7 +47,8 @@ jobs:
         run: bash fetch_dictionary.sh "latest" "core"
 
       - name: Build sudachi-xcdat-compress
-        working-directory: sudachi.rs
+        # sudachi-xcdat-compress is defined in the `sudachi-cli` crate
+        working-directory: sudachi-cli
         run: cargo build --release --bin sudachi-xcdat-compress
 
       - name: Produce .xdic using xcdat tools
@@ -57,15 +58,15 @@ jobs:
         run: |
           set -e
           mkdir -p artifacts
-          ./sudachi.rs/target/release/sudachi-xcdat-compress resources/system.dic -o artifacts/system_core.xdic
+          # The cargo workspace target directory is at `target/` in the repo root
+          target/release/sudachi-xcdat-compress resources/system.dic -o artifacts/system_core.xdic
           ls -la artifacts
 
       - name: Build wasip2 wasm artifact (sudachi-wasm)
-        working-directory: sudachi.rs
         run: |
           set -e
           source $HOME/.cargo/env || true
-          # attempt to build the cdylib for wasip2
+          # build the sudachi-wasm package for the wasip2 target (if available)
           cargo build --release --target wasm32-wasip2 -p sudachi-wasm || true
           mkdir -p artifacts
           # copy any produced wasm into artifacts (glob to be flexible)
