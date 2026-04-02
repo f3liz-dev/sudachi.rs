@@ -11,5 +11,8 @@ sudachi = { path = "../sudachi", default-features = false }
 wit-bindgen = "0.53"
 zstd = { version = "0.13", default-features = false, features = ["no_asm"] }
 
+[build-dependencies]
+which = "4"
+
 [package.metadata.component]
 package = "sudachi:tokenizer"

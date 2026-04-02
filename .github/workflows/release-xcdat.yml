@@ -1,0 +1,67 @@
+name: Build XCDAT trie, convert dictionary, and publish release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config cmake git python3 python3-pip python3-venv ninja-build
+
+      - name: Install Meson and Ninja (pip)
+        run: python3 -m pip install --upgrade meson ninja
+
+      - name: Clone xcdat-trie
+        run: git clone https://github.com/f3liz-dev/xcdat-trie.git xcdat-trie
+
+      - name: Build and install xcdat-trie
+        env:
+          XCDAT_PREFIX: ${{ github.workspace }}/xcdat-install
+        run: |
+          set -e
+          cd xcdat-trie
+          meson setup builddir --prefix="$XCDAT_PREFIX"
+          meson compile -C builddir
+          meson install -C builddir
+          echo "Installed files:"
+          ls -la "$XCDAT_PREFIX/bin" || true
+
+      - name: Download dictionary
+        run: bash fetch_dictionary.sh "latest" "core"
+
+      - name: Build sudachi-xcdat-compress
+        run: cargo build --release -p sudachi-xcdat-compress
+
+      - name: Produce .xdic using xcdat tools
+        env:
+          XCDAT_BUILD_BIN: ${{ github.workspace }}/xcdat-install/bin/xcdat_build
+          XCDAT_ENUMERATE_BIN: ${{ github.workspace }}/xcdat-install/bin/xcdat_enumerate
+        run: |
+          set -e
+          mkdir -p artifacts
+          target/release/sudachi-xcdat-compress resources/system.dic -o artifacts/system_core.xdic
+          ls -la artifacts
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: system_core.xdic
+          path: artifacts/system_core.xdic
+
+      - name: Create GitHub Release and attach artifact (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: artifacts/system_core.xdic
+          tag: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
