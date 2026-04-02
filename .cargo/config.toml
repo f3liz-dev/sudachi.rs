@@ -1,4 +1,4 @@
 [target.wasm32-wasip2]
 
 [env]
-CC_wasm32_wasip2 = { value = "wasm32-wasip2-clang.sh", relative = true }
+CC_wasm32_wasip2 = { value = ".cargo/wasm32-wasip2-clang.sh", relative = true, condition = "cfg(any(target_os = \"linux\", target_os = \"macos\"))" }
