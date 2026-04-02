@@ -1,0 +1,4 @@
+[target.wasm32-wasip2]
+
+[env]
+CC_wasm32_wasip2 = { value = "wasm32-wasip2-clang.sh", relative = true }

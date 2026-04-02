@@ -1,0 +1,16 @@
+package xcdat:trie;
+
+interface api {
+    resource trie {
+        constructor(path: string);
+        lookup: func(key: string) -> option<u64>;
+        decode: func(id: u64) -> string;
+        common-prefix-search: func(key: string) -> list<tuple<u64, string>>;
+        predictive-search: func(key: string) -> list<tuple<u64, string>>;
+        save: func(path: string);
+    }
+}
+
+world xcdat {
+    export api;
+}

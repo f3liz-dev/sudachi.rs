@@ -61,7 +61,7 @@ fn build_lexicon_1word() {
     );
     let mut built = Vec::new();
     bldr.write_lexicon(&mut built, 0).unwrap();
-    let mut lex = Lexicon::parse(&built, 0, true).unwrap();
+    let (mut lex, _) = Lexicon::parse(&built, 0, true).unwrap();
     lex.set_dic_id(0);
     let mut iter = lex.lookup("京都".as_bytes(), 0);
     assert_eq!(

@@ -191,3 +191,49 @@ fn morpheme_extraction() {
     assert_eq!(0, e.begin_c());
     assert_eq!(3, e.end_c());
 }
+
+#[test]
+fn xdic_tokenize_readings() {
+    use sudachi::dic::character_category::CharacterCategory;
+    use sudachi::dic::LoadedDictionary;
+    use sudachi::analysis::stateful_tokenizer::StatefulTokenizer;
+    use sudachi::prelude::MorphemeList;
+
+    let xdic = std::fs::read("../../demo/system_core.xdic").expect("read system_core.xdic");
+    let char_def = std::fs::read("../resources/char.def").expect("read char.def");
+    let dict = LoadedDictionary::from_xdic(&xdic, CharacterCategory::from_bytes(&char_def).unwrap(), 65536)
+        .expect("from_xdic failed");
+    println!("pos_list len: {}", dict.grammar.pos_list.len());
+    println!("connect matrix: {}x{}", dict.grammar.conn_matrix().num_left(), dict.grammar.conn_matrix().num_right());
+
+    let mut tok = StatefulTokenizer::create(&dict, false, Mode::C);
+    let mut ms = MorphemeList::empty(&dict);
+    tok.reset().push_str("今日はいい天気ですね。");
+    tok.do_tokenize().unwrap();
+    ms.collect_results(&mut tok).unwrap();
+
+    for m in ms.iter() { println!("{}\t{}", m.surface(), m.reading_form()); }
+
+    let m0 = ms.get(0);
+    let r: &str = &m0.reading_form();
+    assert!(r == "キョウ" || r == "コンニチ", "got {r}");
+}
+
+#[test]
+fn xcdat_lookup_kyou() {
+    use sudachi::dic::lexicon::xcdat_trie::XcdatTrie;
+    let xdic = std::fs::read("../../demo/system_core.xdic").expect("xdic");
+    let pos = 272usize;
+    let mut p = pos;
+    let grammar_len = u32::from_le_bytes(xdic[p..p+4].try_into().unwrap()) as usize; p += 4 + grammar_len;
+    let xcdat_len = u32::from_le_bytes(xdic[p..p+4].try_into().unwrap()) as usize; p += 4;
+    let xcdat_bytes = &xdic[p..p+xcdat_len]; p += xcdat_len;
+    let r2o_count = u32::from_le_bytes(xdic[p..p+4].try_into().unwrap()) as usize; p += 4;
+    let rank_to_offset: Vec<u32> = (0..r2o_count).map(|i| u32::from_le_bytes(xdic[p+i*4..p+i*4+4].try_into().unwrap())).collect();
+
+    let trie = XcdatTrie::parse(xcdat_bytes, rank_to_offset).unwrap();
+    let hits: Vec<_> = trie.common_prefix_search("今日".as_bytes(), 0).collect();
+    let kyou = hits.iter().find(|e| e.end == 6).expect("今日 not found");
+    let ima  = hits.iter().find(|e| e.end == 3).expect("今 not found");
+    assert_ne!(kyou.value, ima.value, "今日 and 今 must have different word_id_table offsets");
+}

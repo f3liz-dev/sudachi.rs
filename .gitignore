@@ -3,6 +3,8 @@
 README*.html
 
 *.dic
+*.xcdat
+*.xdic
 /tests/resources/*.tmp
 
 # IDE files

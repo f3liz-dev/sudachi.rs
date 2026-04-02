@@ -14,12 +14,19 @@ license.workspace = true
 sudachi = { path = "../sudachi" }
 
 cfg-if = "1.0.0" # MIT/Apache 2.0
-clap = { version = "4.5", features = ["derive"] } # MIT/Apache 2.0
+clap = { version = "4.5", features = ["derive", "env"] } # MIT/Apache 2.0
 memmap2 = "0.9" # MIT/Apache 2.0
+anyhow = "1"
+tempfile = "3"
+zstd = "0.13"
 
 [[bin]]
 name = "sudachi"
 path = "src/main.rs"
+
+[[bin]]
+name = "sudachi-xcdat-compress"
+path = "src/xcdat_compress.rs"
 
 [features]
 # Compile dictionary into executable (specifying dictionary becomes optional)

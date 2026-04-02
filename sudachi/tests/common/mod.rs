@@ -80,7 +80,7 @@ lazy_static! {
             .expect("Failed to read grammar for tests");
     pub static ref LEXICON: Lexicon<'static> = {
         let offset = Header::STORAGE_SIZE + GRAMMAR.storage_size;
-        let mut lex = Lexicon::parse(&DICTIONARY_BYTES, offset, HEADER.has_synonym_group_ids())
+        let (mut lex, _) = Lexicon::parse(&DICTIONARY_BYTES, offset, HEADER.has_synonym_group_ids())
             .expect("Failed to read lexicon for tests");
         lex.set_dic_id(0);
         lex

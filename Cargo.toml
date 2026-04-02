@@ -4,6 +4,8 @@ members = [
     "sudachi",
     "sudachi-cli",
     "sudachi-fuzz",
+    "sudachi-wasm",
+    "sudachi-wasm-web",
     "plugin/input_text/*",
     "plugin/oov/*",
     "plugin/path_rewrite/*",
