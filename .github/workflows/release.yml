@@ -1,4 +1,4 @@
-name: Build XCDAT trie, convert dictionary, and publish release
+name: Release in npm
 
 on:
   workflow_dispatch:
@@ -8,6 +8,9 @@ on:
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -43,24 +46,35 @@ jobs:
           echo "Installed files:"
           ls -la "$XCDAT_PREFIX/bin" || true
 
-      - name: Download dictionary
-        run: bash fetch_dictionary.sh "latest" "core"
-
       - name: Build sudachi-xcdat-compress
         # sudachi-xcdat-compress is defined in the `sudachi-cli` crate
         working-directory: sudachi-cli
         run: cargo build --release --bin sudachi-xcdat-compress
 
-      - name: Produce .xdic using xcdat tools
+      - name: Download and convert all dictionaries to .xdic
         env:
           XCDAT_BUILD_BIN: ${{ github.workspace }}/xcdat-install/bin/xcdat_build
           XCDAT_ENUMERATE_BIN: ${{ github.workspace }}/xcdat-install/bin/xcdat_enumerate
         run: |
           set -e
           mkdir -p artifacts
-          # The cargo workspace target directory is at `target/` in the repo root
+          
+          # Convert small dictionary
+          echo "Processing small dictionary..."
+          bash fetch_dictionary.sh "latest" "small"
+          target/release/sudachi-xcdat-compress resources/system.dic -o artifacts/system_small.xdic
+          
+          # Convert core dictionary
+          echo "Processing core dictionary..."
+          bash fetch_dictionary.sh "latest" "core"
           target/release/sudachi-xcdat-compress resources/system.dic -o artifacts/system_core.xdic
-          ls -la artifacts
+          
+          # Convert full dictionary
+          echo "Processing full dictionary..."
+          bash fetch_dictionary.sh "latest" "full"
+          target/release/sudachi-xcdat-compress resources/system.dic -o artifacts/system_full.xdic
+          
+          ls -lh artifacts/
 
       - name: Build wasm artifact (sudachi-wasm)
         run: |
@@ -73,18 +87,49 @@ jobs:
           cp -v target/wasm32-unknown-unknown/release/*.wasm artifacts/
           ls -la artifacts
 
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli
+
+      - name: Generate npm package with wasm-bindgen
+        run: |
+          set -e
+          source $HOME/.cargo/env || true
+          cd sudachi-wasm
+          wasm-bindgen ../target/wasm32-unknown-unknown/release/sudachi_wasm.wasm \
+            --out-dir pkg \
+            --target web \
+            --typescript
+          # Copy package.json to pkg directory
+          cp package.json pkg/
+          ls -la pkg
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: xcdat-artifacts
           path: |
-            artifacts/system_core.xdic
+            artifacts/*.xdic
             artifacts/*.wasm
 
-      - name: Create GitHub Release and attach artifact (on tag)
+      - name: Create GitHub Release with xdic files
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: ncipollo/release-action@v1
+        uses: softprops/action-gh-release@v1
         with:
-          artifacts: artifacts/system_core.xdic,artifacts/*.wasm
-          tag: ${{ github.ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            artifacts/system_small.xdic
+            artifacts/system_core.xdic
+            artifacts/system_full.xdic
+          draft: false
+          prerelease: false
+
+      - name: Setup Node.js
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish to npm with OIDC (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: sudachi-wasm
+        run: npm publish --provenance --access public

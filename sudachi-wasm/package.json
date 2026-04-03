@@ -1,17 +1,18 @@
 {
-  "name": "sudachi-wasm",
+  "name": "@f3liz/sudachi-wasm",
   "version": "0.1.0",
   "description": "WebAssembly build of Sudachi Japanese tokenizer",
-  "main": "sudachi_wasm.js",
-  "types": "sudachi_wasm.d.ts",
+  "main": "pkg/sudachi_wasm.js",
+  "types": "pkg/sudachi_wasm.d.ts",
   "files": [
-    "sudachi_wasm_bg.wasm",
-    "sudachi_wasm.js",
-    "sudachi_wasm.d.ts"
+    "pkg/sudachi_wasm_bg.wasm.d.ts",
+    "pkg/sudachi_wasm_bg.wasm",
+    "pkg/sudachi_wasm.js",
+    "pkg/sudachi_wasm.d.ts"
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/WorksApplications/sudachi.rs"
+    "url": "git+https://github.com/f3liz-dev/sudachi.rs.git"
   },
   "keywords": [
     "wasm",
