@@ -26,7 +26,7 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           source $HOME/.cargo/env
           rustup default stable
-          rustup target add wasm32-wasip2 || true
+          rustup target add wasm32-unknown-unknown
 
       - name: Clone xcdat-trie
         run: git clone https://github.com/f3liz-dev/xcdat-trie.git xcdat-trie
@@ -62,29 +62,16 @@ jobs:
           target/release/sudachi-xcdat-compress resources/system.dic -o artifacts/system_core.xdic
           ls -la artifacts
 
-      - name: Download wasi-sdk
-        run: |
-          set -e
-          export WASI_SDK_PATH=${{ github.workspace }}/wasi-sdk
-          mkdir -p "$WASI_SDK_PATH"
-          cd /tmp
-          wget https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-32/wasi-sdk-32.0-x86_64-linux.tar.gz
-          tar xzf wasi-sdk-32.0-x86_64-linux.tar.gz -C "$WASI_SDK_PATH" --strip-components=1
-          echo "WASI_SDK_PATH=$WASI_SDK_PATH" >> $GITHUB_ENV
-
-      - name: Build wasip2 wasm artifact (sudachi-wasm)
-        env:
-          CC_wasm32_wasip2: ${{ github.workspace }}/wasi-sdk/bin/clang --sysroot=${{ github.workspace }}/wasi-sdk/share/wasi-sysroot
-          AR_wasm32_wasip2: ${{ github.workspace }}/wasi-sdk/bin/llvm-ar
+      - name: Build wasm artifact (sudachi-wasm)
         run: |
           set -e
           source $HOME/.cargo/env || true
-          # build the sudachi-wasm package for the wasip2 target with wasi-sdk
-          cargo build --release --target wasm32-wasip2 -p sudachi-wasm || true
+          # build the sudachi-wasm package for the wasm32-unknown-unknown target
+          cargo build --release --target wasm32-unknown-unknown -p sudachi-wasm
           mkdir -p artifacts
-          # copy any produced wasm into artifacts (glob to be flexible)
-          cp -v target/wasm32-wasip2/release/*.wasm artifacts/ 2>/dev/null || true
-          ls -la artifacts || true
+          # copy any produced wasm into artifacts
+          cp -v target/wasm32-unknown-unknown/release/*.wasm artifacts/
+          ls -la artifacts
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

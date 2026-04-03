@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sudachi WASM Demo</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        h1 {
+            color: #333;
+        }
+        .input-group {
+            margin: 20px 0;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 600;
+        }
+        textarea {
+            width: 100%;
+            padding: 10px;
+            font-size: 16px;
+            border: 2px solid #ddd;
+            border-radius: 4px;
+            font-family: inherit;
+        }
+        select, button {
+            padding: 10px 20px;
+            font-size: 16px;
+            border-radius: 4px;
+            border: 2px solid #007bff;
+            margin-right: 10px;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            border-color: #ccc;
+            cursor: not-allowed;
+        }
+        #output {
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 4px;
+            border: 2px solid #ddd;
+            white-space: pre-wrap;
+            font-family: monospace;
+            min-height: 100px;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            font-weight: 600;
+        }
+        .status.loading {
+            background: #fff3cd;
+            color: #856404;
+        }
+        .status.ready {
+            background: #d4edda;
+            color: #155724;
+        }
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+    </style>
+</head>
+<body>
+    <h1>🗾 Sudachi WASM Demo</h1>
+    
+    <div id="status" class="status loading">Loading dictionary...</div>
+
+    <div class="input-group">
+        <label for="input">Japanese Text:</label>
+        <textarea id="input" rows="4" placeholder="Enter Japanese text...">選挙管理委員会</textarea>
+    </div>
+
+    <div class="input-group">
+        <label for="mode">Tokenization Mode:</label>
+        <select id="mode">
+            <option value="0">Mode A (Short units - finest)</option>
+            <option value="1">Mode B (Middle units)</option>
+            <option value="2" selected>Mode C (Long units - coarsest)</option>
+        </select>
+        <button id="tokenize" disabled>Tokenize</button>
+    </div>
+
+    <div class="input-group">
+        <label>Output:</label>
+        <pre id="output">Waiting for dictionary to load...</pre>
+    </div>
+
+    <script type="module">
+        import init, { loadDictionary, tokenize, freeDictionary } from './pkg/sudachi_wasm.js';
+
+        let dictHandle = null;
+        const statusEl = document.getElementById('status');
+        const outputEl = document.getElementById('output');
+        const tokenizeBtn = document.getElementById('tokenize');
+        const inputEl = document.getElementById('input');
+        const modeEl = document.getElementById('mode');
+
+        function setStatus(message, type = 'loading') {
+            statusEl.textContent = message;
+            statusEl.className = `status ${type}`;
+        }
+
+        async function setup() {
+            try {
+                setStatus('Initializing WASM module...', 'loading');
+                
+                // Initialize the WASM module
+                await init();
+                
+                setStatus('Loading dictionary file...', 'loading');
+                
+                // Load dictionary from URL (you need to provide this file)
+                // For demo purposes, this will fail if the dictionary file is not available
+                const response = await fetch('system.xdic');
+                if (!response.ok) {
+                    throw new Error('Dictionary file not found. Please place system.xdic in the same directory.');
+                }
+                
+                const dictBytes = new Uint8Array(await response.arrayBuffer());
+                
+                setStatus('Parsing dictionary...', 'loading');
+                dictHandle = loadDictionary(dictBytes);
+                
+                setStatus(`✓ Ready! Dictionary loaded (handle: ${dictHandle})`, 'ready');
+                tokenizeBtn.disabled = false;
+                outputEl.textContent = 'Ready to tokenize. Click the button above!';
+                
+            } catch (error) {
+                setStatus(`✗ Error: ${error.message}`, 'error');
+                outputEl.textContent = `Error loading dictionary:\n${error.message}\n\nPlease make sure system.xdic is available in the same directory as this HTML file.`;
+                console.error('Setup error:', error);
+            }
+        }
+
+        tokenizeBtn.addEventListener('click', () => {
+            if (!dictHandle) {
+                outputEl.textContent = 'Error: Dictionary not loaded';
+                return;
+            }
+
+            try {
+                const text = inputEl.value.trim();
+                if (!text) {
+                    outputEl.textContent = 'Please enter some text to tokenize.';
+                    return;
+                }
+
+                const mode = parseInt(modeEl.value);
+                
+                // Tokenize
+                const tokens = tokenize(dictHandle, text, mode);
+                
+                // Format output
+                let result = `Input: ${text}\n`;
+                result += `Mode: ${['A (short)', 'B (middle)', 'C (long)'][mode]}\n`;
+                result += `Tokens: ${tokens.length}\n\n`;
+                result += 'Surface\t\tReading\t\tPart-of-Speech\n';
+                result += '─'.repeat(70) + '\n';
+                
+                for (const token of tokens) {
+                    result += `${token.surface}\t\t${token.reading}\t\t${token.pos}\n`;
+                }
+                
+                outputEl.textContent = result;
+                
+            } catch (error) {
+                outputEl.textContent = `Error during tokenization:\n${error.message}`;
+                console.error('Tokenization error:', error);
+            }
+        });
+
+        // Also allow Enter key in textarea
+        inputEl.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                if (!tokenizeBtn.disabled) {
+                    tokenizeBtn.click();
+                }
+            }
+        });
+
+        // Clean up on page unload
+        window.addEventListener('beforeunload', () => {
+            if (dictHandle !== null) {
+                freeDictionary(dictHandle);
+            }
+        });
+
+        // Start setup
+        setup();
+    </script>
+</body>
+</html>

@@ -1,4 +1,4 @@
-[target.wasm32-wasip2]
+[target.wasm32-unknown-unknown]
 
 [env]
-CC_wasm32_wasip2 = { value = ".cargo/wasm32-wasip2-clang.sh", relative = true, condition = "cfg(any(target_os = \"linux\", target_os = \"macos\"))" }
+CC_wasm32_unknown_unknown = { value = "/opt/homebrew/opt/llvm/bin/clang", condition = "cfg(target_os = \"macos\")" }

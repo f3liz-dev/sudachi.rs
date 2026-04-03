@@ -1,0 +1,5 @@
+# Generated bindings
+pkg/
+pkg-node/
+
+# Build artifacts are in parent target directory
