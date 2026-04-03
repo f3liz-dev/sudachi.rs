@@ -9,6 +9,8 @@ WebAssembly build of Sudachi Japanese tokenizer for use in browsers and Node.js.
 ```bash
 # Build the WASM module
 cargo build --target wasm32-unknown-unknown --release
+# or, if you are in macOS, run `brew install llvm` and
+# CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang cargo build --target wasm32-unknown-unknown --release
 
 # Install wasm-bindgen-cli (if not already installed)
 cargo install wasm-bindgen-cli
@@ -30,16 +32,19 @@ wasm-bindgen ../target/wasm32-unknown-unknown/release/sudachi_wasm.wasm \
 
 #### `loadDictionary(xdicBytes: Uint8Array): number`
 
-Load a dictionary from `.xdic` file bytes. Returns a handle ID for use with other functions.
+Load a dictionary from `.xdic` file bytes. Returns a handle ID for use with
+other functions.
 
 **Parameters:**
+
 - `xdicBytes`: Uint8Array containing the dictionary file contents
 
 **Returns:** Dictionary handle (number)
 
 **Example:**
+
 ```javascript
-const response = await fetch('system.xdic');
+const response = await fetch("system.xdic");
 const dictBytes = new Uint8Array(await response.arrayBuffer());
 const handle = loadDictionary(dictBytes);
 ```
@@ -49,6 +54,7 @@ const handle = loadDictionary(dictBytes);
 Tokenize Japanese text using the loaded dictionary.
 
 **Parameters:**
+
 - `handle`: Dictionary handle from `loadDictionary`
 - `text`: Japanese text to tokenize
 - `mode`: Tokenization mode
@@ -57,14 +63,16 @@ Tokenize Japanese text using the loaded dictionary.
   - `2`: Mode C (long units - coarsest granularity, default)
 
 **Returns:** Array of token objects with properties:
+
 - `surface`: Surface form of the token
 - `reading`: Reading (pronunciation) of the token
 - `pos`: Part of speech tag
 
 **Example:**
+
 ```javascript
-const tokens = tokenize(handle, '選挙管理委員会', 0);
-tokens.forEach(token => {
+const tokens = tokenize(handle, "選挙管理委員会", 0);
+tokens.forEach((token) => {
     console.log(`${token.surface} (${token.reading}) - ${token.pos}`);
 });
 ```
@@ -74,9 +82,11 @@ tokens.forEach(token => {
 Free a dictionary handle and release its resources.
 
 **Parameters:**
+
 - `handle`: Dictionary handle to free
 
 **Example:**
+
 ```javascript
 freeDictionary(handle);
 ```
@@ -88,20 +98,24 @@ freeDictionary(handle);
 See `demo.html` for a complete interactive example.
 
 ```javascript
-import init, { loadDictionary, tokenize, freeDictionary } from './pkg/sudachi_wasm.js';
+import init, {
+    freeDictionary,
+    loadDictionary,
+    tokenize,
+} from "./pkg/sudachi_wasm.js";
 
 // Initialize the WASM module
 await init();
 
 // Load dictionary
-const response = await fetch('system.xdic');
+const response = await fetch("system.xdic");
 const dictBytes = new Uint8Array(await response.arrayBuffer());
 const handle = loadDictionary(dictBytes);
 
 // Tokenize with Mode C (long units)
-const tokens = tokenize(handle, '東京スカイツリー', 2);
+const tokens = tokenize(handle, "東京スカイツリー", 2);
 
-tokens.forEach(token => {
+tokens.forEach((token) => {
     console.log(`${token.surface}\t${token.reading}\t${token.pos}`);
 });
 
@@ -114,17 +128,19 @@ freeDictionary(handle);
 See `example-node.js` for a complete example.
 
 ```javascript
-const { loadDictionary, tokenize, freeDictionary } = require('./pkg-node/sudachi_wasm.js');
-const fs = require('fs');
+const { loadDictionary, tokenize, freeDictionary } = require(
+    "./pkg-node/sudachi_wasm.js",
+);
+const fs = require("fs");
 
 // Load dictionary
-const dictBytes = new Uint8Array(fs.readFileSync('system.xdic'));
+const dictBytes = new Uint8Array(fs.readFileSync("system.xdic"));
 const handle = loadDictionary(dictBytes);
 
 // Tokenize
-const tokens = tokenize(handle, '東京スカイツリー', 2);
+const tokens = tokenize(handle, "東京スカイツリー", 2);
 
-tokens.forEach(token => {
+tokens.forEach((token) => {
     console.log(`${token.surface}\t${token.reading}\t${token.pos}`);
 });
 
@@ -152,9 +168,12 @@ python3 -m http.server 8000
 
 Sudachi supports three tokenization modes with different granularities:
 
-- **Mode A (0)**: Short units (finest) - e.g., "選挙管理委員会" → ["選挙", "管理", "委員", "会"]
-- **Mode B (1)**: Middle units - e.g., "選挙管理委員会" → ["選挙", "管理", "委員会"]
-- **Mode C (2)**: Long units (coarsest) - e.g., "選挙管理委員会" → ["選挙管理委員会"]
+- **Mode A (0)**: Short units (finest) - e.g., "選挙管理委員会" → ["選挙",
+  "管理", "委員", "会"]
+- **Mode B (1)**: Middle units - e.g., "選挙管理委員会" → ["選挙", "管理",
+  "委員会"]
+- **Mode C (2)**: Long units (coarsest) - e.g., "選挙管理委員会" →
+  ["選挙管理委員会"]
 
 ## Build Configuration
 
@@ -176,10 +195,12 @@ The project is configured to build for `wasm32-unknown-unknown` target:
 - The dictionary file (`.xdic`) must be loaded before tokenization
 - Multiple dictionaries can be loaded simultaneously with different handles
 - Always call `freeDictionary()` when done to avoid memory leaks
-- The WASM module is built for `wasm32-unknown-unknown` target for maximum compatibility
-- For production use, consider compressing the dictionary file (it's quite large)
+- The WASM module is built for `wasm32-unknown-unknown` target for maximum
+  compatibility
+- For production use, consider compressing the dictionary file (it's quite
+  large)
 
 ## TypeScript Support
 
-The generated bindings include TypeScript type definitions (`.d.ts` files), providing full type safety and IDE autocomplete support.
-
+The generated bindings include TypeScript type definitions (`.d.ts` files),
+providing full type safety and IDE autocomplete support.

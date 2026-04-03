@@ -1,4 +1,0 @@
-[target.wasm32-unknown-unknown]
-
-[env]
-CC_wasm32_unknown_unknown = { value = "/opt/homebrew/opt/llvm/bin/clang", condition = "cfg(target_os = \"macos\")" }
