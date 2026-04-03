@@ -1,6 +1,6 @@
 {
   "name": "@f3liz/sudachi-wasm",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "WebAssembly build of Sudachi Japanese tokenizer",
   "main": "pkg/sudachi_wasm.js",
   "types": "pkg/sudachi_wasm.d.ts",

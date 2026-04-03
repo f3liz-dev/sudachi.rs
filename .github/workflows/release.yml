@@ -131,8 +131,6 @@ jobs:
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
-      - run: npm ci
-        working-directory: sudachi-wasm
 
       - name: Publish to npm with OIDC (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
